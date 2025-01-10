@@ -121,7 +121,7 @@ class NeuralMemory(Module):
 
         self.to_momentum = LinearNoBias(dim, 1)
         self.to_adaptive_step = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
-        self.to_decay_factor = nn.Sequential(LinearNoBias(dim, 1), nn.Sigmoid()) # weight decay factor
+        self.to_decay_factor = LinearNoBias(dim, 1) # weight decay factor
 
     def init_weights_and_momentum(self):
         params = TensorDict(dict(self.memory_model.named_parameters()))
@@ -148,10 +148,10 @@ class NeuralMemory(Module):
 
         batch = seq.shape[0]
 
-        adaptive_lr = self.to_adaptive_step(seq)
-        adaptive_momentum = self.to_momentum(seq)
+        adaptive_lr = self.to_adaptive_step(seq).tanh() * 0.5 + 0.5.
 
-        decay_factor = self.to_decay_factor(seq)
+        adaptive_momentum = self.to_momentum(seq).sigmoid()
+        decay_factor = self.to_decay_factor(seq).sigmoid()
 
         # keys and values
 
