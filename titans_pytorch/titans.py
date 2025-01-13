@@ -90,6 +90,8 @@ class NeuralMemory(Module):
         self,
         dim,
         chunk_size = 1,
+        dim_head = None,
+        heads = 1,
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
         pre_rmsnorm = True,
@@ -100,13 +102,26 @@ class NeuralMemory(Module):
     ):
         super().__init__()
 
+        # norms
+
         self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
         self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
 
         self.post_rmsnorm = nn.RMSNorm(dim) if post_rmsnorm else nn.Identity()
 
+        # maybe multi-headed
+
+        dim_head = default(dim_head, dim)
+        dim_inner = dim_head * heads
+
+        self.split_heads = Rearrange('b n (h d) -> (b h) n d', h = heads)
+        self.merge_heads = Rearrange('(b h) n d -> b n (h d)', h = heads)
+        self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
+
+        # memory mlp
+
         if not exists(model):
-            model = MLP(dim, **default_mlp_kwargs)
+            model = MLP(dim_head, **default_mlp_kwargs)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 
@@ -129,11 +144,11 @@ class NeuralMemory(Module):
 
         # queries for retrieving from the model
 
-        self.to_queries = LinearNoBias(dim, dim)
+        self.to_queries = LinearNoBias(dim, dim_inner)
 
         # keys and values for storing to the model
 
-        self.to_keys_values = LinearNoBias(dim, dim * 2)
+        self.to_keys_values = LinearNoBias(dim, dim_inner * 2)
         self.store_memory_loss_fn = store_memory_loss_fn
 
         # learned adaptive learning rate and momentum
@@ -141,20 +156,22 @@ class NeuralMemory(Module):
 
         self.to_momentum = nn.Sequential(
             Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
-            LinearNoBias(dim, 1)
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> (b h) n 1')
         )
 
         self.to_adaptive_step = nn.Sequential(
             Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
-            LinearNoBias(dim, 1),
-            Rearrange('... 1 -> ...')
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> (b h) n')
         )
 
         # weight decay factor
 
         self.to_decay_factor = nn.Sequential(
             Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
-            LinearNoBias(dim, 1)
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> (b h) n 1')
         )
 
     def init_weights_and_momentum(self):
@@ -192,9 +209,7 @@ class NeuralMemory(Module):
 
         # pack batch and sequence dimension
 
-        batch = seq.shape[0]
-
-        adaptive_lr = self.to_adaptive_step(seq).sigmoid()
+        adaptive_lr = (self.to_adaptive_step(seq).sigmoid() * -15).exp() # from 1. - 1e-7
 
         adaptive_momentum = self.to_momentum(seq).sigmoid()
         decay_factor = self.to_decay_factor(seq).sigmoid()
@@ -202,6 +217,12 @@ class NeuralMemory(Module):
         # keys and values
 
         keys, values = self.to_keys_values(seq).chunk(2, dim = -1)
+
+        # maybe multi head
+
+        keys, values = map(self.split_heads, (keys, values))
+
+        batch = keys.shape[0]
 
         # take care of chunking
 
@@ -254,7 +275,7 @@ class NeuralMemory(Module):
         past_weights: dict[str, Tensor] | None = None,
     ):
         chunk_size = self.chunk_size
-        batch, seq_len = seq.shape[:2]
+        seq_len = seq.shape[1]
 
         seq = self.retrieve_norm(seq)
 
@@ -284,6 +305,12 @@ class NeuralMemory(Module):
 
         queries = self.to_queries(seq)
 
+        # maybe multihead
+
+        queries = self.split_heads(queries)
+
+        batch = queries.shape[0]
+
         # fetch values from memory model
 
         curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
@@ -296,6 +323,14 @@ class NeuralMemory(Module):
         # reconstitute batch dimension
 
         values = rearrange(values, '(b n) c d -> b (n c) d', b = batch)
+
+        # maybe merge heads and combine
+
+        values = self.merge_heads(values)
+
+        values = self.combine_head(values)
+
+        # post norm, somehow could not stabilize this without it, not in paper
 
         values = self.post_rmsnorm(values)
 
