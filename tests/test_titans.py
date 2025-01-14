@@ -1,9 +1,9 @@
+import torch
 import pytest
 
-import torch
-from titans_pytorch import NeuralMemory
-
 def test_titans():
+    from titans_pytorch import NeuralMemory
+
     mem = NeuralMemory(
         dim = 384,
         chunk_size = 64,
@@ -15,13 +15,10 @@ def test_titans():
     assert seq.shape == retrieved.shape
 
 def test_titans_attn_memory():
-    from titans_pytorch import MemoryAttention
+    from titans_pytorch.titans_attn_memory import NeuralMemory
 
     mem = NeuralMemory(
         dim = 384,
-        model = MemoryAttention(
-            dim = 384
-        ),
         chunk_size = 64,
     )
 
