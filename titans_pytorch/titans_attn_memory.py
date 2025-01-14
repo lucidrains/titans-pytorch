@@ -57,28 +57,38 @@ def pack_one_with_inverse(t, pattern):
 
 # classes
 
-class MemoryMLP(Module):
+# improvised attention as memory module
+# todo - expand if see signal in experiments (update: not seeing it)
+
+class MemoryAttention(Module):
     def __init__(
         self,
-        dim,
-        depth
+        dim
     ):
         super().__init__()
-        self.weights = nn.ParameterList([nn.Parameter(torch.randn(dim, dim)) for _ in range(depth)])
+        self.weights = nn.ParameterList([
+            nn.Parameter(torch.randn(dim, dim)), # queries
+            nn.Parameter(torch.randn(dim, dim)), # keys
+            nn.Parameter(torch.randn(dim, dim)), # values weight 1
+            nn.Parameter(torch.randn(dim, dim)), # values weight 2
+        ])
 
-    def forward(
-        self,
-        x
-    ):
-        for ind, weight in enumerate(self.weights):
-            is_first = ind == 0
+    def forward(self, x):
 
-            if not is_first:
-                x = F.silu(x)
+        assert x.shape[-2] > 1, 'chunk size needs to be greater than 1 for using attention as memory'
 
-            x = x @ weight
+        wq, wk, wv1, wv2 = self.weights
 
-        return x
+        q = x @ wq
+        k = x @ wk
+        v = x @ wv1
+
+        hidden = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal = True
+        )
+
+        return F.silu(hidden) @ wv2
 
 # main neural memory
 
@@ -92,14 +102,12 @@ class NeuralMemory(Module):
         chunk_size = 1,
         dim_head = None,
         heads = 1,
-        model: Module | None = None,
+        model: MemoryAttention | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
         pre_rmsnorm = True,
         post_rmsnorm = True,
         use_accelerated_scan = False,
-        default_mlp_kwargs: dict = dict(
-            depth = 4
-        )
+        default_model_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -122,7 +130,7 @@ class NeuralMemory(Module):
         # memory mlp
 
         if not exists(model):
-            model = MemoryMLP(dim_head, **default_mlp_kwargs)
+            model = MemoryAttention(dim_head, **default_model_kwargs)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 
@@ -317,12 +325,12 @@ class NeuralMemory(Module):
 
         seq = self.retrieve_norm(seq)
 
-        assert seq_len >= chunk_size
+        assert seq_len > chunk_size
 
-        seq = seq[:, (chunk_size - 1):]
+        seq = seq[:, chunk_size:]
         curtailed_seq_len = seq.shape[-2]
 
-        next_seq_len = round_up_multiple(curtailed_seq_len, chunk_size)
+        next_seq_len = round_up_multiple(curtailed_seq_len + 1, chunk_size)
 
         padding = next_seq_len - curtailed_seq_len
 
@@ -374,7 +382,7 @@ class NeuralMemory(Module):
 
         # restore
 
-        values = pad_at_dim(values, (chunk_size - 1, 0), dim = 1, value = 0.) # todo, used a learned null memory embedding instead of 0s for retrieving from empty neural memory
+        values = pad_at_dim(values, (chunk_size, 0), dim = 1, value = 0.) # todo, used a learned null memory embedding instead of 0s for retrieving from empty neural memory
         values = values[:, :-padding]
 
         return values
@@ -388,7 +396,7 @@ class NeuralMemory(Module):
     ):
         batch, seq_len = seq.shape[:2]
 
-        if seq_len < self.chunk_size:
+        if seq_len <= self.chunk_size:
             return torch.zeros_like(seq)
 
         if exists(past_state):
