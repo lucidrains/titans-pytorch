@@ -21,7 +21,8 @@ from titans_pytorch import NeuralMemory
 mem = NeuralMemory(
     dim = 384,
     chunk_size = 64,
-    pre_rmsnorm = True
+    pre_rmsnorm = True,
+    dim_head=384,
 ).cuda()
 
 seq = torch.randn(2, 1024, 384).cuda()
