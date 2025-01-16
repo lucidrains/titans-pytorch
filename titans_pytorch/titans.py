@@ -218,7 +218,7 @@ class NeuralMemory(Module):
             pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
             weighted_loss = loss * loss_weights
-            return weighted_loss.sum(), loss.mean()
+            return weighted_loss.sum(), weighted_loss.mean()
 
         self.per_sample_grad_fn = vmap(grad(forward_and_loss, has_aux = True), in_dims = (None, 0, 0, 0))
 
@@ -409,7 +409,7 @@ class NeuralMemory(Module):
         if not return_aux_kv_loss:
             return updates, next_state
 
-        return updates, next_state, aux_kv_recon_loss
+        return updates, next_state, aux_kv_recon_loss.mean()
 
     def retrieve_memories(
         self,

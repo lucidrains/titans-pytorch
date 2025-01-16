@@ -24,13 +24,14 @@ SHOULD_GENERATE = False
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-mac-transformer'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
 NEURAL_MEM_LAYERS = (2, 4)
 WINDOW_SIZE = 32
-RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
+KV_RECON_LOSS_WEIGHT = 0.1
+RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS} - kv recon loss 0.1'
 
 # wandb experiment tracker
 
@@ -63,6 +64,7 @@ model = MemoryAsContextTransformer(
     num_longterm_mem_tokens = NUM_LONGTERM_MEM,
     neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_segment_len = WINDOW_SIZE // 2,
+    aux_kv_recon_loss_weight = KV_RECON_LOSS_WEIGHT,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
@@ -108,20 +110,20 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader), return_loss = True)
+        loss, (ar_loss, kv_recon_losses) = model(next(train_loader), return_loss = True, return_loss_breakdown = True)
         loss.backward()
 
-    print(f'training loss: {loss.item()}')
+    print(f'training loss: {ar_loss.item()}')
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-    wandb.log(dict(loss = loss.item()))
+    wandb.log(dict(loss = ar_loss.item()))
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader), return_loss = True)
-            print(f'validation loss: {loss.item()}')
+            loss, (ar_loss, _) = model(next(val_loader), return_loss = True, return_loss_breakdown = True)
+            print(f'validation loss: {ar_loss.item()}')
 
     if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
         model.eval()

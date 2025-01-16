@@ -95,7 +95,7 @@ class SegmentedAttention(Module):
         dim_head = 64,
         heads = 8,
         accept_value_residual = False,
-        attend_kwargs: dict = dict()
+        attend_kwargs: dict = dict(),
     ):
         super().__init__()
         self.norm = nn.RMSNorm(dim)
@@ -201,6 +201,7 @@ class MemoryAsContextTransformer(Module):
         num_residual_streams = 4,
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
+        aux_kv_recon_loss_weight = 0.
     ):
         super().__init__()
 
@@ -276,10 +277,18 @@ class MemoryAsContextTransformer(Module):
 
         self.to_logits = LinearNoBias(dim, num_tokens)
 
+        # auxiliary loss on kv recon
+
+        self.has_aux_kv_recon_loss = aux_kv_recon_loss_weight > 0.
+        self.aux_kv_recon_loss_weight = aux_kv_recon_loss_weight
+
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+
     def forward(
         self,
         x,
-        return_loss = False
+        return_loss = False,
+        return_loss_breakdown = False
     ):
 
         if return_loss:
@@ -317,6 +326,10 @@ class MemoryAsContextTransformer(Module):
 
         value_residual = None
 
+        # aux losses
+
+        kv_recon_losses = self.zero
+
         # expand and reduce streams for hyper connections
 
         x = self.expand_streams(x)
@@ -324,7 +337,8 @@ class MemoryAsContextTransformer(Module):
         for (attn, ff), maybe_neural_mem in zip(self.layers, self.neural_mem_layers):
 
             if exists(maybe_neural_mem):
-                x = maybe_neural_mem(x)
+                x, aux_kv_loss = maybe_neural_mem(x, return_aux_kv_loss = True)
+                kv_recon_losses = kv_recon_losses + aux_kv_loss
 
             x, values = attn(x, value_residual = value_residual)
 
@@ -351,4 +365,14 @@ class MemoryAsContextTransformer(Module):
         if not return_loss:
             return logits
 
-        return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
+        ar_loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
+
+        losses = ar_loss
+
+        if self.has_aux_kv_recon_loss:
+            losses = losses + kv_recon_losses * self.aux_kv_recon_loss_weight
+
+        if not return_loss_breakdown:
+            return losses
+
+        return losses, (ar_loss, kv_recon_losses)
