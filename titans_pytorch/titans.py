@@ -6,7 +6,7 @@ from functools import partial
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from torch.nn import Linear, Module
+from torch.nn import Linear, Module, Parameter, ParameterList
 from torch.func import functional_call, vmap, grad
 
 from tensordict import TensorDict
@@ -88,7 +88,7 @@ class MultiheadRMSNorm(Module):
     def __init__(self, dim, heads):
         super().__init__()
         self.rmsnorm = nn.RMSNorm(dim, elementwise_affine = False)
-        self.gamma = nn.Parameter(torch.zeros(heads, 1, dim))
+        self.gamma = Parameter(torch.zeros(heads, 1, dim))
 
     def forward(self, x):
         return self.rmsnorm(x) * (self.gamma + 1.)
@@ -102,7 +102,10 @@ class MemoryMLP(Module):
         depth
     ):
         super().__init__()
-        self.weights = nn.ParameterList([nn.Parameter(torch.randn(dim, dim)) for _ in range(depth)])
+        self.weights = ParameterList([Parameter(torch.randn(dim, dim)) for _ in range(depth)])
+
+        for weight in self.weights:
+            nn.init.xavier_uniform_(weight)
 
     def forward(
         self,
@@ -118,24 +121,65 @@ class MemoryMLP(Module):
 
         return x
 
+# memory mlp with factorized weights
+# so can tradeoff capacity for smaller chunk sizes
+
+class FactorizedMemoryMLP(Module):
+    def __init__(
+        self,
+        dim,
+        depth,
+        k = 32
+    ):
+        super().__init__()
+        self.weights = ParameterList([
+            ParameterList([
+                Parameter(torch.randn(dim, k)),
+                Parameter(torch.randn(k, dim)),
+            ]) for _ in range(depth)
+        ])
+
+        for weight1, weight2 in self.weights:
+            nn.init.xavier_uniform_(weight1)
+            nn.init.xavier_uniform_(weight2)
+
+    def forward(
+        self,
+        x
+    ):
+        for ind, (weight1, weight2) in enumerate(self.weights):
+            is_first = ind == 0
+
+            if not is_first:
+                x = F.silu(x)
+
+            x = x @ weight1 @ weight2
+
+        return x
+
 # improvised attention as memory module
 
 class MemoryAttention(Module):
     def __init__(
         self,
         dim,
-        scale = 8.
+        scale = 8.,
+        expansion_factor = 2.
     ):
         super().__init__()
         self.scale = scale
+        dim_ff_hidden = int(dim * expansion_factor)
 
         self.weights = nn.ParameterList([
             nn.Parameter(torch.randn(dim, dim)), # queries
             nn.Parameter(torch.randn(dim, dim)), # keys
             nn.Parameter(torch.randn(dim, dim)), # values
-            nn.Parameter(torch.randn(dim, dim * 2)), # ff w1
-            nn.Parameter(torch.randn(dim * 2, dim)), # ff w2
+            nn.Parameter(torch.randn(dim, dim_ff_hidden)), # ff w1
+            nn.Parameter(torch.randn(dim_ff_hidden, dim)), # ff w2
         ])
+
+        for weight in self.weights:
+            nn.init.xavier_uniform_(weight)
 
     def forward(self, x):
         wq, wk, wv, ffw1, ffw2 = self.weights
@@ -535,6 +579,7 @@ class NeuralMemory(Module):
         updates, aux_kv_recon_loss = self.store_memories(store_seq, past_state, return_aux_kv_loss = True)
 
         past_weights, _ = past_state
+
 
         retrieved = self.retrieve_memories(seq, past_weights + updates)
 
