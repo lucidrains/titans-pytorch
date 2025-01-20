@@ -1,10 +1,11 @@
 from __future__ import annotations
 from typing import Callable
+
 import math
 from functools import partial
 
 import torch
-from torch import nn, Tensor
+from torch import nn, cat, Tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, Parameter, ParameterList
 from torch.func import functional_call, vmap, grad
@@ -153,6 +154,46 @@ class MemoryMLP(Module):
             x = x @ weight
 
         return x
+
+# memory mlp, but with gated residual + final projection
+
+class GatedResidualMemoryMLP(Module):
+    def __init__(
+        self,
+        dim,
+        depth
+    ):
+        super().__init__()
+        self.depth = depth
+
+        self.weights = ParameterList([
+            ParameterList([
+                Parameter(torch.randn(dim, dim)),
+                Parameter(torch.randn(dim * 2, dim)),
+            ]) for _ in range(depth)
+        ])
+
+        self.final_proj = Parameter(torch.randn(dim, dim))
+
+        for param in self.parameters():
+            nn.init.xavier_uniform_(param)
+
+    def forward(
+        self,
+        x
+    ):
+        for weight, to_gates in self.weights:
+            res = x
+
+            x = x @ weight
+            x = F.silu(x)
+
+            # gated residual
+
+            gates = cat((x, res), dim = -1) @ to_gates
+            x = res.lerp(x, gates.sigmoid())
+
+        return x @ self.final_proj
 
 # memory mlp with factorized weights
 # so can tradeoff capacity for smaller chunk sizes
