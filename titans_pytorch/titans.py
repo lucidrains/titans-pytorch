@@ -324,7 +324,11 @@ class AssocScan(Module):
         super().__init__()
         self.use_accelerated = use_accelerated
 
-    def forward(self, gates, inputs):
+    def forward(self, gates, inputs, prev = None):
+
+        if exists(prev):
+            inputs, _ = pack([prev, inputs], 'b * d')
+            gates = pad_at_dim(gates, (1, 0), value = 1., dim = -2)
 
         if not self.use_accelerated:
             _, outputs = associative_scan(binary_operator, (gates, inputs))
@@ -789,7 +793,9 @@ class NeuralMemory(Module):
 
         # store if storage sequence cache hits the chunk size
 
-        if cache_store_seq.shape[-2] == self.chunk_size:
+        store_seq_cache_len = cache_store_seq.shape[-2]
+
+        if store_seq_cache_len == self.chunk_size:
             updates, _ = self.store_memories(cache_store_seq, mem_model_state)
 
             past_weights, past_momentum = mem_model_state
