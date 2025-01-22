@@ -365,6 +365,7 @@ class NeuralMemory(Module):
         momentum = True,
         pre_rmsnorm = True,
         post_rmsnorm = True,
+        qk_rmsnorm = False,
         learned_mem_model_weights = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
@@ -388,6 +389,9 @@ class NeuralMemory(Module):
         self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
 
         self.multihead_rmsnorm = MultiheadRMSNorm(dim_head, heads) if post_rmsnorm else nn.Identity()
+
+        self.q_norm = MultiheadRMSNorm(dim_head, heads) if qk_rmsnorm else nn.Identity()
+        self.k_norm = MultiheadRMSNorm(dim_head, heads) if qk_rmsnorm else nn.Identity()
 
         # maybe multi-headed
 
@@ -577,6 +581,10 @@ class NeuralMemory(Module):
 
         batch = keys.shape[0]
 
+        # maybe qk rmsnorm
+
+        keys = self.k_norm(keys)
+
         # take care of chunking
 
         keys, values = tuple(rearrange(t, 'b (n c) d -> (b n) c d', c = chunk_size) for t in (keys, values))
@@ -682,6 +690,10 @@ class NeuralMemory(Module):
         # maybe multihead
 
         queries = self.split_heads(queries)
+
+        # maybe qk rmsnorm
+
+        queries = self.q_norm(queries)
 
         # fetch values from memory model
 

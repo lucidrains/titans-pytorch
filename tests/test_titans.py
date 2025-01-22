@@ -13,6 +13,7 @@ def exists(v):
 @pytest.mark.parametrize('learned_mem_model_weights', (False, True))
 @pytest.mark.parametrize('attn_pool_chunks', (False, True))
 @pytest.mark.parametrize('momentum', (False, True))
+@pytest.mark.parametrize('qk_rmsnorm', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
 @pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
 def test_titans(
@@ -21,6 +22,7 @@ def test_titans(
     learned_mem_model_weights,
     attn_pool_chunks,
     momentum,
+    qk_rmsnorm,
     max_grad_norm,
     per_parameter_lr_modulation
 ):
@@ -31,6 +33,7 @@ def test_titans(
         attn_pool_chunks = attn_pool_chunks,
         max_grad_norm = max_grad_norm,
         momentum = momentum,
+        qk_rmsnorm = qk_rmsnorm,
         per_parameter_lr_modulation = per_parameter_lr_modulation,
         learned_mem_model_weights = learned_mem_model_weights
     )
