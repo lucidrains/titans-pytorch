@@ -184,9 +184,10 @@ def test_mac(
     assert logits.shape == (1, seq_len, 256)
 
 @pytest.mark.parametrize('sliding', (False, True))
-@pytest.mark.parametrize('mem_layers', (()))
+@pytest.mark.parametrize('mem_layers', ((), None))
 @pytest.mark.parametrize('longterm_mems', (0, 4, 16))
-@pytest.mark.parametrize('prompt_len', (0, 4, 16))
+@pytest.mark.parametrize('prompt_len', (4, 16))
+@torch_default_dtype(torch.float64)
 def test_mac_sampling(
     sliding,
     mem_layers,

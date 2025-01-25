@@ -53,6 +53,7 @@ WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 USE_ACCELERATED_SCAN = True
 USE_FLEX_ATTN = True
+USE_FAST_INFERENCE = False
 
 # wandb experiment tracker
 
@@ -163,6 +164,6 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         prime = decode_tokens(inp)
         print(f'%s \n\n %s', (prime, '*' * 100))
 
-        sample = model.sample(inp[None, ...], GENERATE_LENGTH)
+        sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = True)
         output_str = decode_tokens(sample[0])
         print(output_str)

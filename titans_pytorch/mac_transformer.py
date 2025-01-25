@@ -111,6 +111,7 @@ def pad_and_segment_with_inverse(
     seq,
     segment_len,
     fold_into_batch = True,
+    inverse_remove_pad = True
 ):
     batch, seq_len = seq.shape[:2]
     next_seq_len_mult = round_up_multiple(seq_len, segment_len)
@@ -124,15 +125,12 @@ def pad_and_segment_with_inverse(
     if fold_into_batch:
         seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
 
-    shape = seq.shape
-
     def inverse(out):
-        unchanged_shape = out.shape == shape
 
         if fold_into_batch:
             out = rearrange(out, '(b w) ... n d -> b ... (w n) d', b = batch)
 
-        if needs_pad and unchanged_shape:
+        if needs_pad and inverse_remove_pad:
             out = out[..., :-padding, :]
 
         return out
@@ -714,7 +712,7 @@ class MemoryAsContextTransformer(Module):
 
         # intersperse longterm memory
 
-        x, inverse_segment = pad_and_segment_with_inverse(x, segment_len)
+        x, inverse_segment = pad_and_segment_with_inverse(x, segment_len, inverse_remove_pad = False)
 
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
         x, inverse_pack_mems = pack_with_inverse((x, mems), 'b * d')
@@ -856,7 +854,9 @@ class MemoryAsContextTransformer(Module):
 
             next_kv_caches = next_kv_caches[..., -attn_window_size:, :]
 
-            if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
+            kv_cache_length = next_kv_caches.shape[-2]
+
+            if not self.sliding_window_attn and divisible_by(kv_cache_length, attn_window_size):
                 next_kv_caches = next_kv_caches[..., 0:0, :]
 
             next_cache = (
@@ -878,7 +878,7 @@ class MemoryAsContextTransformer(Module):
 
         if not is_inferencing:
 
-            x, inverse_segment = pad_and_segment_with_inverse(x, attn_window_size)
+            x, inverse_segment = pad_and_segment_with_inverse(x, attn_window_size, inverse_remove_pad = False)
 
             x, _ = inverse_pack_mems(x)
 
