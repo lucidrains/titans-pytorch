@@ -284,7 +284,7 @@ class NeuralMemory(Module):
         adaptive_step_transform: Callable | None = None,
         default_step_transform_max_lr = 1.,
         per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
-        max_mem_layer_modulation = 1e1, # max of 10.
+        max_mem_layer_modulation = 1., # max of 10.
         attn_pool_chunks = False,
         momentum = True,
         pre_rmsnorm = True,
@@ -293,6 +293,9 @@ class NeuralMemory(Module):
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         activation: Module | None = None,
+        init_adaptive_step_bias = None,
+        init_momentum_bias = None,
+        init_decay_bias = None,
         default_model_kwargs: dict = dict(
             depth = 2
         )
@@ -411,12 +414,12 @@ class NeuralMemory(Module):
         # learned adaptive learning rate and momentum
 
         self.to_momentum = Sequential(
-            LinearNoBias(dim, heads),
+            nn.Linear(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         ) if momentum else None
 
         self.to_adaptive_step = Sequential(
-            LinearNoBias(dim, heads),
+            nn.Linear(dim, heads),
             Rearrange('b n h -> (b h) n')
         )
 
@@ -428,7 +431,7 @@ class NeuralMemory(Module):
         # per layer learning rate modulation
 
         self.to_layer_modulation = Sequential(
-            LinearNoBias(dim, heads * self.num_memory_parameter_tensors),
+            nn.Linear(dim, heads * self.num_memory_parameter_tensors),
             Rearrange('b n (h w) -> w (b h) n', h = heads),
             nn.Sigmoid()
         ) if per_parameter_lr_modulation else None
@@ -442,9 +445,26 @@ class NeuralMemory(Module):
         # weight decay factor
 
         self.to_decay_factor = Sequential(
-            LinearNoBias(dim, heads),
+            nn.Linear(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
+
+        # inits
+
+        if exists(init_adaptive_step_bias):
+            linear = self.to_adaptive_step[0]
+            nn.init.zeros_(linear.weight)
+            nn.init.constant_(linear.bias, init_adaptive_step_bias)
+
+        if exists(init_momentum_bias):
+            linear = self.to_momentum[0]
+            nn.init.zeros_(linear.weight)
+            nn.init.constant_(linear.bias, init_momentum_bias)
+
+        if exists(init_decay_bias):
+            linear = self.to_decay_factor[0]
+            nn.init.zeros_(linear.weight)
+            nn.init.constant_(linear.bias, init_decay_bias)
 
         # maybe use accelerated scan
 
