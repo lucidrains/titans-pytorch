@@ -303,6 +303,7 @@ class NeuralMemory(Module):
         init_momentum_bias = None,
         init_decay_bias = None,
         accept_weight_residual = False,
+        gated_transition = False,
         default_model_kwargs: dict = dict(
             depth = 2
         )
@@ -463,6 +464,11 @@ class NeuralMemory(Module):
             nn.Linear(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
+
+        # learned transition, as seeing instability when decreasing neural mem batch size
+        # perhaps it can slowly learn to adjust from early residual to fully transitioning to new weights every batch size
+
+        self.transition_gate = nn.Parameter(tensor(-5.)) if gated_transition else None
 
         # inits
 
@@ -832,6 +838,13 @@ class NeuralMemory(Module):
 
         store_seqs = store_seq.split(split_sizes, dim = -2)
 
+        # whether to allow network to slowly adjust from initial weight throughout (residual path) to fully updating weights every batch
+
+        gate = None
+
+        if exists(self.transition_gate):
+            gate = self.transition_gate.sigmoid()
+
         for ind, store_seq_chunk in enumerate(store_seqs):
             is_last = ind == (len(store_seqs) - 1)
 
@@ -857,7 +870,10 @@ class NeuralMemory(Module):
 
             last_update, _ = past_state
 
-            weights = last_update
+            if exists(gate):
+                weights = TensorDict({param_name: v1.lerp(v2, gate) for (param_name, v1), (_, v2) in zip(weights.items(), last_update.items())})
+            else:
+                weights = last_update
 
             next_neural_mem_state = tuple_index_set(next_neural_mem_state, 1, last_update)
 
