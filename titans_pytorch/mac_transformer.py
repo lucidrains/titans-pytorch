@@ -493,12 +493,20 @@ class MemoryAsContextTransformer(Module):
         use_flex_attn = False,
         sliding_window_attn = False,
         neural_mem_weight_residual = False,
+        token_emb: Module | None = None,
+        abs_pos_emb: Module | None = None
     ):
         super().__init__()
 
-        self.token_emb = nn.Embedding(num_tokens, dim)
+        if not exists(token_emb):
+            token_emb = nn.Embedding(num_tokens, dim)
 
-        self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
+        self.token_emb = token_emb
+
+        if not exists(abs_pos_emb):
+            abs_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
+
+        self.abs_pos_emb = abs_pos_emb
 
         # long term mem tokens
 
