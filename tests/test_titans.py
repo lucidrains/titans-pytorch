@@ -85,9 +85,9 @@ def test_return_surprises():
 
     seq = torch.randn(4, 64, 384)
 
-    _, _, surprises = mem(seq, return_surprises = True)
+    _, _, (surprises, adaptive_lr) = mem(seq, return_surprises = True)
 
-    assert surprises.shape == (4, 4, 64)
+    assert all([t.shape == (4, 4, 64) for t in (surprises, adaptive_lr)])
 
 @pytest.mark.parametrize('learned_momentum_combine', (False, True))
 @pytest.mark.parametrize('learned_combine_include_zeroth', (False, True))

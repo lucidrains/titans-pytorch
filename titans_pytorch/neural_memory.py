@@ -652,6 +652,7 @@ class NeuralMemory(Module):
 
         # surprises
 
+        adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
         unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
 
         # maybe softclamp grad norm
@@ -695,7 +696,7 @@ class NeuralMemory(Module):
             if not return_surprises:
                 return output
 
-            return (*output, unweighted_mem_model_loss)
+            return (*output, (unweighted_mem_model_loss, adaptive_lr))
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
@@ -755,7 +756,7 @@ class NeuralMemory(Module):
         if not return_surprises:
             return updates, next_store_state
 
-        return updates, next_store_state, unweighted_mem_model_loss
+        return updates, next_store_state, (unweighted_mem_model_loss, adaptive_lr)
 
     def retrieve_memories(
         self,
