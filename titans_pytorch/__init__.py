@@ -1,5 +1,7 @@
 from titans_pytorch.neural_memory import (
     NeuralMemory,
+    NeuralMemState,
+    mem_state_detach
 )
 
 from titans_pytorch.memory_models import (

@@ -405,3 +405,23 @@ def test_assoc_scan(
     assert second_half.shape == inputs2.shape
 
     assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-5)
+
+def test_mem_state_detach():
+    from titans_pytorch.neural_memory import mem_state_detach
+
+    mem = NeuralMemory(
+        dim = 384,
+        chunk_size = 2,
+        qk_rmsnorm = True,
+        dim_head = 64,
+        heads = 4,
+    )
+
+    seq = torch.randn(4, 64, 384)
+
+    state = None
+
+    for _ in range(2):
+        parallel_retrieved, state = mem(seq, state = state)
+        state = mem_state_detach(state)
+        parallel_retrieved.sum().backward()

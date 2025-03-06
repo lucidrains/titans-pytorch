@@ -7,10 +7,11 @@ from itertools import zip_longest
 from collections import namedtuple
 
 import torch
-from torch import nn, stack, cat, tensor, Tensor
+from torch import nn, stack, cat, is_tensor, tensor, Tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, Parameter, ParameterList, ParameterDict
 from torch.func import functional_call, vmap, grad
+from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
 from tensordict import TensorDict
 
@@ -40,6 +41,8 @@ u - key / value updates - allowing a token to emit multiple key / values
 
 LinearNoBias = partial(Linear, bias = False)
 
+# neural mem state related
+
 NeuralMemState = namedtuple('NeuralMemState', [
     'seq_index',
     'weights',
@@ -47,6 +50,13 @@ NeuralMemState = namedtuple('NeuralMemState', [
     'states',
     'updates',
 ])
+
+def mem_state_detach(
+    state: NeuralMemState
+):
+    assert isinstance(state, NeuralMemState)
+    state = tree_map(lambda t: t.detach() if is_tensor(t) else t, tuple(state))
+    return NeuralMemState(*state)
 
 # functions
 
