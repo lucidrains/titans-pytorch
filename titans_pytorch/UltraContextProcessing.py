@@ -14,7 +14,7 @@ import numpy as np
 from collections import defaultdict, Counter
 
 # Assuming UltraContext Core is imported
-from ultracontext.core import (
+from UltraContextCore.py import (
     DEFAULT_PERF_CONFIG,
     PerformanceConfig,
     get_norm_class,
