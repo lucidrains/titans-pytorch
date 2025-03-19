@@ -1,1173 +1,575 @@
-from __future__ import annotations
-from typing import Callable, Optional, Dict, List, Tuple, Union, Any, NamedTuple, TypeVar, Protocol, Literal
 import math
-import logging
-import time
-import json
-import os
-import hashlib
-import uuid
-from enum import Enum
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+from typing import Dict, List, Optional, Tuple, Union, Any, NamedTuple, TypeVar, Callable, Set
+from enum import Enum, auto
 from dataclasses import dataclass, field
-from functools import partial, lru_cache, wraps
-from itertools import zip_longest
-from collections import namedtuple, defaultdict, deque, Counter
+from collections import defaultdict, OrderedDict, deque
+import time
+import logging
+from functools import partial, lru_cache
+import os
+import uuid
+import einops
+import hashlib
+from einops import rearrange, reduce, repeat
+import numpy as np
+import heapq
 from contextlib import contextmanager
 
-import torch
-from torch import nn, stack, cat, is_tensor, tensor, Tensor
-import torch.nn.functional as F
-from torch.nn import Linear, Module, Parameter, ParameterList, ParameterDict
-from torch.func import functional_call, vmap, grad, vjp
-from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
-from torch.distributed import rpc
-from torch.cuda.amp import autocast, GradScaler
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
-from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-import torch.sparse as sparse
+# Optional imports that will be used when available
+try:
+    from torch.utils.checkpoint import checkpoint
+    HAS_CHECKPOINTING = True
+except ImportError:
+    HAS_CHECKPOINTING = False
 
-from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
+try:
+    import faiss
+    HAS_FAISS = True
+except ImportError:
+    HAS_FAISS = False
 
-# Assume these are available or will be implemented
-from titans_pytorch.associative_scan import AssocScan
-from titans_pytorch.memory_models import MemoryMLP, ResidualNorm
-from titans_pytorch.sparse_ops import BlockSparseLinear, SparseAttention
-from titans_pytorch.quantization import QuantizationMixedPrecision, DynamicQuantizer
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
 
-import einx
-from einops import einsum, rearrange, repeat, reduce, pack, unpack
-from einops.layers.torch import Rearrange, Reduce
+# Configure logging
+logger = logging.getLogger('UltraScaleNeuralMemory')
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-# Configuration and logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('AdvancedEnterpriseNeuralMemory')
+##############################################
+# Advanced Neural Memory Hierarchies        #
+##############################################
 
-# Type hints
-TensorDict_t = TypeVar('TensorDict_t', bound=TensorDict)
+class NeuralMemoryTier(Enum):
+    """
+    Hierarchical memory tiers for 100M+ token contexts with specialized functions
+    """
+    FOCUS = auto()        # Current working focus (highest precision, fastest access, tiny)
+    ACTIVE = auto()       # Active working context (high precision, ultrafast access, small)
+    FOREGROUND = auto()   # Recent important context (high precision, very fast access)
+    BACKGROUND = auto()   # Supporting context (medium precision, fast access)
+    EPISODIC = auto()     # Recent context sequences (medium precision, medium access speed)
+    SEMANTIC = auto()     # Distilled knowledge (compressed semantic representations)
+    GENERAL = auto()      # Medium-term context (lower precision, compressed)
+    CATEGORICAL = auto()  # Categorized historical information (specialized compression)
+    ARCHIVAL = auto()     # Historical context (highly compressed, indexed)
+    REFERENCE = auto()    # External knowledge (compressed symbolic pointers)
+    CONSOLIDATED = auto() # Distilled and integrated knowledge (min. size, max. information)
+    OFFLOADED = auto()    # External storage (retrieval via learned indices)
 
-"""
-Advanced Enterprise Neural Memory: Ultra-scalable memory architecture for production AI systems
-
-Key innovations:
-1. Multi-Tier Memory Hierarchy (Hot/Warm/Cold storage with automatic migration)
-2. Extreme Context Window Expansion (100K+ tokens) via hierarchical compression
-3. Ultra-Sparse Attention Mechanisms (O(n log n) scaling)
-4. Retrieval-Augmented Memory Integration with external vector stores
-5. Memory Lifecycle Management with automatic pruning and consolidation
-6. Advanced Quantization with mixed 1/2/4/8-bit precision
-7. Semantic Clustering for improved long-term retention
-8. Distributed Hierarchical Memory Sharding for massive scalability
-9. Predictive Memory Prefetching for latency reduction
-10. Self-optimizing memory pathways with reinforcement learning
-11. Hardware-Aware Adaptive Computation for maximum efficiency
-12. Enterprise-grade observability, security, and compliance features
-13. Memory Distillation for continuous knowledge consolidation
-14. Adversarial robustness through memory diversification
-15. Global/Local memory specialization with transfer capabilities
-"""
-
-#############################################################
-# Enhanced memory tiers and lifecycle management            #
-#############################################################
-
-class MemoryTier(Enum):
-    """Memory tier designations for multi-tiered memory hierarchy"""
-    HOT = 0      # Immediate, recent memories (highest precision, fastest access)
-    WARM = 1     # Medium-term memories (medium precision, compression applied)
-    COLD = 2     # Long-term memories (highly compressed, may be offloaded)
-    ARCHIVED = 3 # Historical memories (max compression, likely offloaded)
-
-class MemoryAccessPattern(Enum):
-    """Memory access patterns for operation optimization"""
-    SEQUENTIAL = 0  # Sequential access pattern
-    RANDOM = 1      # Random access pattern
-    CLUSTERED = 2   # Clustered access (locality-sensitive)
-    HOTSPOT = 3     # Hotspot access (frequently accessing same locations)
+class NeuralCognitiveSignals(Enum):
+    """Memory management signals for token importance and attention allocation"""
+    SALIENCE = auto()     # Information importance/relevance 
+    NOVELTY = auto()      # New or unexpected information
+    RECENCY = auto()      # Recent activation/access
+    FREQUENCY = auto()    # Access frequency/pattern
+    COHERENCE = auto()    # Contextual fit/alignment
+    CAUSALITY = auto()    # Causal significance
+    UNCERTAINTY = auto()  # Model uncertainty about token
+    PREDICTION = auto()   # Prediction error/surprise
+    EMOTION = auto()      # Sentiment/emotional loading
+    UTILITY = auto()      # Task-relevance utility
 
 @dataclass
-class MemoryMetrics:
-    """Enhanced metrics tracking for production monitoring and auto-optimization"""
+class TokenMetadata:
+    """Rich metadata for token management and retrieval"""
+    # Core identifiers
+    token_id: int
+    position: int
+    creation_time: float
+    sequence_id: Optional[str] = None
     
-    # Core metrics
+    # Memory management
+    tier: NeuralMemoryTier = NeuralMemoryTier.ACTIVE
+    importance: float = 0.5  # Overall importance score
+    last_access_time: float = 0.0
     access_count: int = 0
-    update_count: int = 0
-    hit_rate: float = 0.0
-    access_latency: float = 0.0
-    update_latency: float = 0.0
-    memory_usage: float = 0.0
-    computation_time: float = 0.0
-    last_timestamp: float = field(default_factory=time.time)
+    access_pattern: List[float] = field(default_factory=list)
     
-    # Enhanced tracking
-    tier_access_counts: Dict[MemoryTier, int] = field(default_factory=lambda: defaultdict(int))
-    tier_hit_rates: Dict[MemoryTier, float] = field(default_factory=lambda: defaultdict(float))
-    access_patterns: Dict[MemoryAccessPattern, int] = field(default_factory=lambda: defaultdict(int))
-    migration_counts: Dict[Tuple[MemoryTier, MemoryTier], int] = field(default_factory=lambda: defaultdict(int))
+    # Cognitive signals (specialized importance indicators)
+    cognitive_signals: Dict[NeuralCognitiveSignals, float] = field(default_factory=dict)
     
-    # Performance metrics
-    gpu_utilization: float = 0.0
-    memory_bandwidth: float = 0.0
-    power_consumption: float = 0.0
-    
-    # System metrics
-    error_count: int = 0
-    throttling_events: int = 0
-    
-    # Time-series metrics storage
-    historical_metrics: Dict[str, List[Tuple[float, float]]] = field(default_factory=dict)
-    
-    def reset(self):
-        """Reset all metrics"""
-        self.__init__()
-        
-    def update_historical(self, metric_name: str, value: float):
-        """Update time-series metrics"""
-        if metric_name not in self.historical_metrics:
-            self.historical_metrics[metric_name] = []
-        
-        self.historical_metrics[metric_name].append((time.time(), value))
-        
-        # Limit history size
-        if len(self.historical_metrics[metric_name]) > 1000:
-            self.historical_metrics[metric_name] = self.historical_metrics[metric_name][-1000:]
-        
-    def log_metrics(self):
-        """Log key metrics to logger"""
-        logger.info(f"Memory Metrics: Hit Rate: {self.hit_rate:.2f}, "
-                   f"Access Latency: {self.access_latency:.4f}ms, "
-                   f"Memory Usage: {self.memory_usage:.2f}MB, "
-                   f"GPU Util: {self.gpu_utilization:.1f}%")
-        
-        # Add tier-specific metrics
-        for tier in MemoryTier:
-            if self.tier_access_counts[tier] > 0:
-                logger.debug(f"{tier.name} Tier: Accesses: {self.tier_access_counts[tier]}, "
-                           f"Hit Rate: {self.tier_hit_rates[tier]:.2f}")
-    
-    def get_telemetry_data(self) -> Dict[str, Any]:
-        """Get telemetry data for external monitoring systems"""
-        return {
-            "hit_rate": self.hit_rate,
-            "access_latency_ms": self.access_latency,
-            "update_latency_ms": self.update_latency,
-            "memory_usage_mb": self.memory_usage,
-            "gpu_utilization": self.gpu_utilization,
-            "power_consumption_w": self.power_consumption,
-            "tier_metrics": {tier.name: {
-                "accesses": self.tier_access_counts[tier],
-                "hit_rate": self.tier_hit_rates[tier]
-            } for tier in MemoryTier if self.tier_access_counts[tier] > 0},
-            "error_count": self.error_count,
-            "timestamp": time.time()
-        }
-
-class MemoryLifecyclePolicy:
-    """Policy engine for memory lifecycle management"""
-    
-    def __init__(
-        self, 
-        hot_retention_time: float = 60.0,  # seconds
-        warm_retention_time: float = 3600.0,  # 1 hour
-        cold_retention_time: float = 86400.0,  # 1 day
-        importance_threshold: float = 0.3,
-        usage_threshold: int = 5,
-        auto_optimize: bool = True
-    ):
-        self.hot_retention_time = hot_retention_time
-        self.warm_retention_time = warm_retention_time
-        self.cold_retention_time = cold_retention_time
-        self.importance_threshold = importance_threshold
-        self.usage_threshold = usage_threshold
-        self.auto_optimize = auto_optimize
-        
-        # Tracking
-        self.last_optimization_time = time.time()
-        self.memory_access_history = defaultdict(list)
-        self.memory_importance_scores = {}
-        
-    def should_migrate(
-        self, 
-        memory_id: str,
-        current_tier: MemoryTier,
-        last_access_time: float,
-        access_count: int,
-        importance_score: float
-    ) -> Optional[MemoryTier]:
-        """Determine if a memory should be migrated to a different tier"""
-        current_time = time.time()
-        time_since_access = current_time - last_access_time
-        
-        # Importance-based retention for frequently accessed items
-        if importance_score > self.importance_threshold * 2:
-            if current_tier != MemoryTier.HOT:
-                return MemoryTier.HOT
-            return None
-            
-        # Time-based migration
-        if current_tier == MemoryTier.HOT and time_since_access > self.hot_retention_time:
-            return MemoryTier.WARM
-        elif current_tier == MemoryTier.WARM and time_since_access > self.warm_retention_time:
-            return MemoryTier.COLD
-        elif current_tier == MemoryTier.COLD and time_since_access > self.cold_retention_time:
-            return MemoryTier.ARCHIVED
-            
-        # Usage-based retention (keep in current tier if used frequently)
-        if access_count > self.usage_threshold:
-            if current_tier == MemoryTier.WARM:
-                return MemoryTier.HOT
-            return None
-            
-        return None
-        
-    def calculate_importance_score(
-        self,
-        memory_id: str,
-        access_history: List[float],
-        surprise_factor: float,
-        semantic_uniqueness: float
-    ) -> float:
-        """Calculate importance score for a memory segment"""
-        # Recency factor - more recent accesses increase importance
-        recency = 0.0
-        current_time = time.time()
-        if access_history:
-            time_diffs = [1.0 / max(1.0, current_time - access_time) for access_time in access_history[-5:]]
-            recency = sum(time_diffs) / len(time_diffs)
-        
-        # Frequency factor - more frequent accesses increase importance
-        frequency = len(access_history) / max(1.0, (current_time - access_history[0]) if access_history else 1.0)
-        
-        # Combined score with surprise and uniqueness
-        importance = (
-            0.3 * recency +
-            0.3 * frequency +
-            0.2 * surprise_factor + 
-            0.2 * semantic_uniqueness
-        )
-        
-        self.memory_importance_scores[memory_id] = importance
-        return importance
-        
-    def optimize_memory_allocation(self, memory_states: Dict[str, Any]) -> Dict[str, Any]:
-        """Periodically optimize memory allocation across tiers"""
-        if not self.auto_optimize:
-            return {}
-            
-        current_time = time.time()
-        if current_time - self.last_optimization_time < 60:  # Only optimize every minute
-            return {}
-            
-        self.last_optimization_time = current_time
-        
-        # Identify migration candidates
-        migrations = {}
-        for memory_id, state in memory_states.items():
-            target_tier = self.should_migrate(
-                memory_id,
-                state.get('tier', MemoryTier.HOT),
-                state.get('last_access_time', 0),
-                state.get('access_count', 0),
-                state.get('importance_score', 0)
-            )
-            
-            if target_tier is not None:
-                migrations[memory_id] = target_tier
-                
-        return migrations
-
-class AdvancedMemState(NamedTuple):
-    """Enhanced memory state with multi-tier storage and lifecycle tracking"""
-    seq_index: int
-    weights: TensorDict_t
-    cache_store_segment: Optional[Tensor] = None
-    states: Tuple[TensorDict_t, TensorDict_t] = None
-    updates: Optional[TensorDict_t] = None
-    metrics: Optional[MemoryMetrics] = None
-    memory_mask: Optional[Tensor] = None  # Indicates active memory regions
-    
-    # Enhanced fields
-    tier: MemoryTier = MemoryTier.HOT
-    last_access_time: float = field(default_factory=time.time)
-    access_count: int = 0
-    importance_score: float = 0.0
+    # Compression state
     compression_ratio: float = 1.0  # 1.0 = no compression
-    quantization_state: Optional[Dict[str, Any]] = None
-    semantic_embedding: Optional[Tensor] = None
-    memory_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
-def mem_state_detach(state: AdvancedMemState) -> AdvancedMemState:
-    """Detach tensors in memory state to prevent gradient flow"""
-    if not isinstance(state, AdvancedMemState):
-        raise TypeError(f"Expected AdvancedMemState but got {type(state)}")
+    precision_bits: int = 32        # Current precision
+    compressed: bool = False
     
-    detached_values = []
-    for idx, value in enumerate(state):
-        if idx >= len(AdvancedMemState._fields):
-            detached_values.append(value)
-            continue
-            
-        if is_tensor(value):
-            detached_values.append(value.detach())
-        elif isinstance(value, TensorDict):
-            detached_values.append(tree_map(lambda t: t.detach() if is_tensor(t) else t, value))
+    # Content properties
+    content_hash: Optional[str] = None
+    semantic_vector: Optional[Tensor] = None
+    token_type: int = 0
+    entity_references: List[str] = field(default_factory=list)
+    
+    # Retrieval aids
+    search_keys: Dict[str, Any] = field(default_factory=dict)
+    tags: Set[str] = field(default_factory=set)
+    
+    # Relational information
+    related_tokens: Dict[int, float] = field(default_factory=dict)  # token_id -> strength
+    causal_predecessors: List[int] = field(default_factory=list)
+    causal_successors: List[int] = field(default_factory=list)
+    
+    # Offloading
+    offloaded: bool = False
+    offload_path: Optional[str] = None
+    
+    def update_cognitive_signals(self, signals: Dict[NeuralCognitiveSignals, float]) -> None:
+        """Update the cognitive signals and recalculate importance"""
+        self.cognitive_signals.update(signals)
+        
+        # Recalculate overall importance (weighted average of signals)
+        # Weights could be learned or set heuristically
+        weights = {
+            NeuralCognitiveSignals.SALIENCE: 0.25,
+            NeuralCognitiveSignals.NOVELTY: 0.15,
+            NeuralCognitiveSignals.RECENCY: 0.20,
+            NeuralCognitiveSignals.FREQUENCY: 0.10,
+            NeuralCognitiveSignals.COHERENCE: 0.10,
+            NeuralCognitiveSignals.CAUSALITY: 0.10,
+            NeuralCognitiveSignals.UNCERTAINTY: 0.03,
+            NeuralCognitiveSignals.PREDICTION: 0.03,
+            NeuralCognitiveSignals.EMOTION: 0.02,
+            NeuralCognitiveSignals.UTILITY: 0.02,
+        }
+        
+        weighted_sum = 0.0
+        weight_total = 0.0
+        
+        for signal, value in self.cognitive_signals.items():
+            if signal in weights:
+                weighted_sum += value * weights[signal]
+                weight_total += weights[signal]
+        
+        if weight_total > 0:
+            self.importance = weighted_sum / weight_total
         else:
-            detached_values.append(value)
-            
-    return AdvancedMemState(*detached_values)
+            # Default when no weighted signals are available
+            self.importance = 0.5
 
-class MemorySegment:
-    """A segment of memory that can be independently managed and compressed"""
-    
-    def __init__(
-        self,
-        memory_id: str,
-        data: Dict[str, Tensor],
-        metadata: Dict[str, Any] = None,
-        tier: MemoryTier = MemoryTier.HOT,
-        semantic_embedding: Optional[Tensor] = None
-    ):
-        self.memory_id = memory_id
-        self.data = TensorDict(data)
-        self.metadata = metadata or {}
-        self.tier = tier
-        self.semantic_embedding = semantic_embedding
-        
-        # Lifecycle tracking
-        self.creation_time = time.time()
-        self.last_access_time = self.creation_time
-        self.access_count = 0
-        self.update_count = 0
-        self.migration_history = [(self.creation_time, tier)]
-        
-    def access(self) -> None:
-        """Record an access to this memory segment"""
-        self.last_access_time = time.time()
+    def update_access(self, current_time: float) -> None:
+        """Update access statistics"""
+        self.last_access_time = current_time
         self.access_count += 1
         
-    def update(self) -> None:
-        """Record an update to this memory segment"""
-        self.last_access_time = time.time()
-        self.update_count += 1
+        # Keep track of last 5 access times for pattern recognition
+        self.access_pattern.append(current_time)
+        if len(self.access_pattern) > 5:
+            self.access_pattern = self.access_pattern[-5:]
         
-    def migrate(self, new_tier: MemoryTier) -> None:
-        """Migrate this memory segment to a new tier"""
-        self.tier = new_tier
-        self.migration_history.append((time.time(), new_tier))
-        
-    def compress(self, ratio: float) -> None:
-        """Compress this memory segment (implemented by derived classes)"""
-        pass
-        
-    def get_size_bytes(self) -> int:
-        """Get the size of this memory segment in bytes"""
-        total_bytes = 0
-        for tensor in self.data.values():
-            if is_tensor(tensor):
-                total_bytes += tensor.nelement() * tensor.element_size()
-        return total_bytes
-        
-    def get_age(self) -> float:
-        """Get the age of this memory segment in seconds"""
-        return time.time() - self.creation_time
-        
-    def to(self, device: torch.device) -> 'MemorySegment':
-        """Move memory segment to a specific device"""
-        self.data = self.data.to(device)
-        if self.semantic_embedding is not None:
-            self.semantic_embedding = self.semantic_embedding.to(device)
-        return self
-        
-    def state_dict(self) -> Dict[str, Any]:
-        """Get a serializable state dict for persistence"""
-        return {
-            "memory_id": self.memory_id,
-            "data": self.data,
-            "metadata": self.metadata,
-            "tier": self.tier.value,
-            "semantic_embedding": self.semantic_embedding,
-            "creation_time": self.creation_time,
-            "last_access_time": self.last_access_time,
-            "access_count": self.access_count,
-            "update_count": self.update_count,
-            "migration_history": self.migration_history
-        }
-        
-    @classmethod
-    def from_state_dict(cls, state_dict: Dict[str, Any]) -> 'MemorySegment':
-        """Create a memory segment from a state dict"""
-        segment = cls(
-            memory_id=state_dict["memory_id"],
-            data=state_dict["data"],
-            metadata=state_dict["metadata"],
-            tier=MemoryTier(state_dict["tier"]),
-            semantic_embedding=state_dict["semantic_embedding"]
-        )
-        
-        segment.creation_time = state_dict["creation_time"]
-        segment.last_access_time = state_dict["last_access_time"]
-        segment.access_count = state_dict["access_count"]
-        segment.update_count = state_dict["update_count"]
-        segment.migration_history = state_dict["migration_history"]
-        
-        return segment
-
-class MemoryManager:
-    """Manages the lifecycle of memory segments across different tiers"""
-    
-    def __init__(
-        self,
-        policy: MemoryLifecyclePolicy = None,
-        max_hot_segments: int = 1000,
-        max_total_segments: int = 10000,
-        enable_offloading: bool = True,
-        offload_path: str = "./memory_offload",
-        enable_telemetry: bool = True,
-        semantic_indexing: bool = True
-    ):
-        self.policy = policy or MemoryLifecyclePolicy()
-        self.max_hot_segments = max_hot_segments
-        self.max_total_segments = max_total_segments
-        self.enable_offloading = enable_offloading
-        self.offload_path = offload_path
-        self.enable_telemetry = enable_telemetry
-        self.semantic_indexing = semantic_indexing
-        
-        # Memory storage by tier
-        self.memories = {
-            MemoryTier.HOT: {},
-            MemoryTier.WARM: {},
-            MemoryTier.COLD: {},
-            MemoryTier.ARCHIVED: {}
-        }
-        
-        # Indexing structures
-        self.memory_ids_by_time = []  # (timestamp, memory_id) pairs
-        self.semantic_index = {}  # Will store semantic embeddings if enabled
-        
-        # Offloading management
-        if enable_offloading and not os.path.exists(offload_path):
-            os.makedirs(offload_path, exist_ok=True)
-            
-        # Metrics
-        self.metrics = MemoryMetrics() if enable_telemetry else None
-        
-    def add_memory_segment(self, segment: MemorySegment) -> None:
-        """Add a new memory segment to the manager"""
-        tier = segment.tier
-        memory_id = segment.memory_id
-        
-        # Add to appropriate tier
-        self.memories[tier][memory_id] = segment
-        
-        # Update indexes
-        self.memory_ids_by_time.append((segment.creation_time, memory_id))
-        
-        # Add to semantic index if enabled
-        if self.semantic_indexing and segment.semantic_embedding is not None:
-            self.semantic_index[memory_id] = segment.semantic_embedding
-            
-        # Check if we need to enforce limits
-        self._enforce_memory_limits()
-        
-        # Update metrics
-        if self.enable_telemetry:
-            self.metrics.tier_access_counts[tier] += 1
-            self.metrics.memory_usage = self._calculate_total_memory_usage()
-            
-    def get_memory_segment(self, memory_id: str) -> Optional[MemorySegment]:
-        """Retrieve a memory segment by ID, potentially loading from offload storage"""
-        # Check in active tiers
-        for tier in MemoryTier:
-            if memory_id in self.memories[tier]:
-                segment = self.memories[tier][memory_id]
-                segment.access()
-                
-                # Update metrics
-                if self.enable_telemetry:
-                    self.metrics.tier_access_counts[tier] += 1
-                    
-                return segment
-                
-        # Check if it's offloaded
-        if self.enable_offloading:
-            offload_path = os.path.join(self.offload_path, f"{memory_id}.pt")
-            if os.path.exists(offload_path):
-                try:
-                    state_dict = torch.load(offload_path)
-                    segment = MemorySegment.from_state_dict(state_dict)
-                    
-                    # Re-add to appropriate tier
-                    self.add_memory_segment(segment)
-                    
-                    # Update metrics
-                    if self.enable_telemetry:
-                        self.metrics.tier_access_counts[MemoryTier.ARCHIVED] += 1
-                        
-                    return segment
-                except Exception as e:
-                    logger.error(f"Failed to load offloaded memory segment {memory_id}: {e}")
-                    
-        return None
-        
-    def update_memory_segment(self, memory_id: str, data_updates: Dict[str, Tensor]) -> bool:
-        """Update an existing memory segment with new data"""
-        segment = self.get_memory_segment(memory_id)
-        if segment is None:
-            return False
-            
-        # Update the data
-        for key, value in data_updates.items():
-            segment.data[key] = value
-            
-        segment.update()
-        
-        # Update metrics
-        if self.enable_telemetry:
-            self.metrics.tier_access_counts[segment.tier] += 1
-            
-        return True
-        
-    def find_similar_memories(
-        self, 
-        query_embedding: Tensor,
-        top_k: int = 5,
-        similarity_threshold: float = 0.7
-    ) -> List[Tuple[str, float]]:
-        """Find semantically similar memories using embedding similarity"""
-        if not self.semantic_indexing:
-            return []
-            
-        results = []
-        
-        # Compute similarities with all indexed memories
-        for memory_id, embedding in self.semantic_index.items():
-            similarity = F.cosine_similarity(query_embedding.unsqueeze(0), embedding.unsqueeze(0))[0].item()
-            if similarity >= similarity_threshold:
-                results.append((memory_id, similarity))
-                
-        # Sort by similarity (descending) and return top-k
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
-        
-    def _enforce_memory_limits(self) -> None:
-        """Enforce memory limits by migrating or offloading segments"""
-        # Check hot tier limits
-        hot_memories = self.memories[MemoryTier.HOT]
-        if len(hot_memories) > self.max_hot_segments:
-            # Sort by importance and migrate least important
-            items = [(memory_id, segment.last_access_time, segment.access_count) 
-                    for memory_id, segment in hot_memories.items()]
-            items.sort(key=lambda x: x[1])  # Sort by last access time
-            
-            # Migrate oldest memories to warm tier
-            num_to_migrate = len(hot_memories) - self.max_hot_segments
-            for i in range(num_to_migrate):
-                memory_id = items[i][0]
-                self._migrate_memory(memory_id, MemoryTier.HOT, MemoryTier.WARM)
-                
-        # Check total memory limits
-        total_count = sum(len(segments) for segments in self.memories.values())
-        if total_count > self.max_total_segments:
-            # Offload or delete oldest memories
-            self.memory_ids_by_time.sort()  # Sort by creation time
-            
-            num_to_offload = total_count - self.max_total_segments
-            for _, memory_id in self.memory_ids_by_time[:num_to_offload]:
-                self._offload_memory(memory_id)
-                
-            # Update the list
-            self.memory_ids_by_time = self.memory_ids_by_time[num_to_offload:]
-            
-    def _migrate_memory(
-        self, 
-        memory_id: str,
-        from_tier: MemoryTier,
-        to_tier: MemoryTier
-    ) -> bool:
-        """Migrate a memory segment from one tier to another"""
-        if memory_id not in self.memories[from_tier]:
-            return False
-            
-        segment = self.memories[from_tier][memory_id]
-        
-        # Apply compression if moving to a colder tier
-        if to_tier.value > from_tier.value:
-            compression_ratio = 1.0 - (0.25 * (to_tier.value - from_tier.value))
-            segment.compress(compression_ratio)
-            
-        # Move to new tier
-        segment.migrate(to_tier)
-        self.memories[to_tier][memory_id] = segment
-        del self.memories[from_tier][memory_id]
-        
-        # Update metrics
-        if self.enable_telemetry:
-            self.metrics.migration_counts[(from_tier, to_tier)] += 1
-            
-        return True
-        
-    def _offload_memory(self, memory_id: str) -> bool:
-        """Offload a memory segment to disk storage"""
-        if not self.enable_offloading:
-            return self._delete_memory(memory_id)
-            
-        # Find the segment in any tier
-        segment = None
-        segment_tier = None
-        for tier in MemoryTier:
-            if memory_id in self.memories[tier]:
-                segment = self.memories[tier][memory_id]
-                segment_tier = tier
-                break
-                
-        if segment is None:
-            return False
-            
-        try:
-            # Save to disk
-            offload_path = os.path.join(self.offload_path, f"{memory_id}.pt")
-            torch.save(segment.state_dict(), offload_path)
-            
-            # Remove from memory
-            del self.memories[segment_tier][memory_id]
-            
-            # Remove from semantic index
-            if self.semantic_indexing and memory_id in self.semantic_index:
-                del self.semantic_index[memory_id]
-                
-            return True
-        except Exception as e:
-            logger.error(f"Failed to offload memory segment {memory_id}: {e}")
-            return False
-            
-    def _delete_memory(self, memory_id: str) -> bool:
-        """Permanently delete a memory segment"""
-        deleted = False
-        
-        # Remove from all tiers
-        for tier in MemoryTier:
-            if memory_id in self.memories[tier]:
-                del self.memories[tier][memory_id]
-                deleted = True
-                
-        # Remove from semantic index
-        if self.semantic_indexing and memory_id in self.semantic_index:
-            del self.semantic_index[memory_id]
-            
-        return deleted
-        
-    def _calculate_total_memory_usage(self) -> float:
-        """Calculate total memory usage in MB"""
-        total_bytes = 0
-        
-        for tier in MemoryTier:
-            for segment in self.memories[tier].values():
-                total_bytes += segment.get_size_bytes()
-                
-        return total_bytes / (1024 * 1024)  # Convert to MB
-        
-    def run_maintenance(self) -> None:
-        """Run periodic maintenance tasks"""
-        # Apply lifecycle policies to migrate memories between tiers
-        migrations = self.policy.optimize_memory_allocation({
-            memory_id: {
-                "tier": segment.tier,
-                "last_access_time": segment.last_access_time,
-                "access_count": segment.access_count,
-                "importance_score": 0.0  # Would be calculated from segment data
-            }
-            for tier in MemoryTier
-            for memory_id, segment in self.memories[tier].items()
+        # Update recency signal
+        self.update_cognitive_signals({
+            NeuralCognitiveSignals.RECENCY: 1.0,  # Just accessed
+            NeuralCognitiveSignals.FREQUENCY: min(1.0, self.access_count / 10.0)  # Normalize frequency
         })
-        
-        # Apply migrations
-        for memory_id, target_tier in migrations.items():
-            # Find current tier
-            current_tier = None
-            for tier in MemoryTier:
-                if memory_id in self.memories[tier]:
-                    current_tier = tier
-                    break
-                    
-            if current_tier is not None and current_tier != target_tier:
-                self._migrate_memory(memory_id, current_tier, target_tier)
-                
-        # Update metrics
-        if self.enable_telemetry:
-            self.metrics.memory_usage = self._calculate_total_memory_usage()
-            self.metrics.log_metrics()
-
-##############################################
-# Advanced quantization and compression      #
-##############################################
-
-class ExtremeBitQuantization(nn.Module):
-    """
-    Ultra-low bit quantization supporting 1, 2, 4, and 8-bit precisions
-    with dynamic precision selection based on importance
-    """
-    def __init__(
-        self,
-        shape: Tuple[int, ...],
-        stats_momentum: float = 0.9,
-        default_precision: int = 8,
-        dynamic_precision: bool = True
-    ):
-        super().__init__()
-        self.shape = shape
-        self.stats_momentum = stats_momentum
-        self.default_precision = default_precision
-        self.dynamic_precision = dynamic_precision
-        
-        # Register statistics buffers
-        self.register_buffer('running_min', torch.zeros(1))
-        self.register_buffer('running_max', torch.ones(1))
-        self.register_buffer('scale', torch.ones(1))
-        self.register_buffer('zero_point', torch.zeros(1, dtype=torch.int32))
-        
-        # Bit precision tracking
-        self.precision_bits = default_precision
-        self.precision_history = []
-        
-        # Compression statistics
-        self.compression_ratio = 32 / default_precision  # Assuming float32 inputs
-        
-    def update_stats(self, x: Tensor) -> None:
-        """Update running statistics for quantization parameters"""
-        with torch.no_grad():
-            x_flat = x.view(-1)
-            current_min, current_max = x_flat.min(), x_flat.max()
-            
-            if len(self.precision_history) == 0:  # First update
-                self.running_min.copy_(current_min)
-                self.running_max.copy_(current_max)
-            else:
-                self.running_min.mul_(self.stats_momentum).add_(
-                    current_min * (1 - self.stats_momentum))
-                self.running_max.mul_(self.stats_momentum).add_(
-                    current_max * (1 - self.stats_momentum))
-                    
-    def _select_optimal_precision(self, importance: float) -> int:
-        """Select optimal bit precision based on importance score"""
-        if importance > 0.8:
-            return 8  # High precision for important weights
-        elif importance > 0.5:
-            return 4
-        elif importance > 0.2:
-            return 2
-        else:
-            return 1  # Ultra-low precision for least important weights
-            
-    def set_precision(self, bits: int, importance: Optional[float] = None) -> None:
-        """Set the quantization precision"""
-        if self.dynamic_precision and importance is not None:
-            bits = self._select_optimal_precision(importance)
-            
-        # Ensure valid bit precision
-        assert bits in (1, 2, 4, 8), f"Bit precision must be 1, 2, 4, or 8, got {bits}"
-        
-        self.precision_bits = bits
-        self.precision_history.append((time.time(), bits))
-        self.compression_ratio = 32 / bits
-        
-        # Update scale and zero point for new precision
-        self._update_quantization_params()
-        
-    def _update_quantization_params(self) -> None:
-        """Update quantization parameters based on current precision"""
-        min_val, max_val = self.running_min.item(), self.running_max.item()
-        qmin, qmax = 0, (1 << self.precision_bits) - 1
-        
-        # Handle special case for min==max
-        if min_val == max_val:
-            scale = 1.0
-            zero_point = 0
-        else:
-            # Calculate scale and zero point
-            scale = (max_val - min_val) / (qmax - qmin)
-            scale = max(scale, 1e-5)  # Avoid division by zero
-            
-            zero_point = qmin - min_val / scale
-            zero_point = max(qmin, min(qmax, int(round(zero_point))))
-            
-        self.scale.fill_(scale)
-        self.zero_point.fill_(zero_point)
-        
-    def quantize(self, x: Tensor) -> Tensor:
-        """Quantize input tensor to specified bit precision"""
-        # Update statistics if in training mode
-        if self.training:
-            self.update_stats(x)
-            self._update_quantization_params()
-            
-        # Apply quantization
-        x_normalized = (x - self.running_min) / (self.running_max - self.running_min + 1e-8)
-        x_scaled = x_normalized * ((1 << self.precision_bits) - 1)
-        x_clipped = x_scaled.clamp(0, (1 << self.precision_bits) - 1)
-        x_rounded = x_clipped.round()
-        
-        # For actual deployment, we'd use custom CUDA kernels for true 1/2/4 bit storage
-        # This simulates the precision loss but doesn't actually compress memory
-        # Dequantize for computation
-        x_dequantized = x_rounded / ((1 << self.precision_bits) - 1)
-        return x_dequantized * (self.running_max - self.running_min) + self.running_min
-        
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass with quantization"""
-        if not self.training and not torch.jit.is_scripting():
-            return self.quantize(x)
-            
-        # During training, use straight-through estimator
-        out = self.quantize(x)
-        out = x + (out - x).detach()  # Gradient straight-through
-        return out
-
-class UltraQuantizedLinear(nn.Module):
-    """
-    Linear layer with ultra-low bit quantization and mixed precision
-    supporting 1, 2, 4, and 8-bit quantization dynamically
-    """
-    def __init__(
-        self, 
-        in_features: int, 
-        out_features: int, 
-        bias: bool = True,
-        quantize: bool = True,
-        weight_precision: int = 8,
-        activation_precision: int = 8,
-        dynamic_precision: bool = True,
-        importance_estimator: Optional[Callable] = None
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.quantize = quantize
-        self.dynamic_precision = dynamic_precision
-        self.importance_estimator = importance_estimator
-        
-        # Initialize weights
-        self.weight = Parameter(torch.empty((out_features, in_features)))
-        if bias:
-            self.bias = Parameter(torch.empty(out_features))
-        else:
-            self.register_parameter('bias', None)
-            
-        # Quantizers
-        if quantize:
-            self.weight_quantizer = ExtremeBitQuantization(
-                self.weight.shape,
-                default_precision=weight_precision,
-                dynamic_precision=dynamic_precision
-            )
-            
-            self.activation_quantizer = ExtremeBitQuantization(
-                (1,),  # Will be reshaped to input shape
-                default_precision=activation_precision,
-                dynamic_precision=dynamic_precision
-            )
-        else:
-            self.weight_quantizer = None
-            self.activation_quantizer = None
-            
-        # Sparsity mask for conditional computation
-        self.register_buffer('sparsity_mask', torch.ones_like(self.weight, dtype=torch.bool))
-        
-        # Meta-information
-        self.pruned_ratio = 0.0
-        self.last_importance_update = 0
-        
-        # Initialize parameters
-        self.reset_parameters()
-        
-    def reset_parameters(self) -> None:
-        """Initialize parameters"""
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
-            
-    def update_precision(self, importance: float) -> None:
-        """Update quantization precision based on importance score"""
-        if not self.quantize or not self.dynamic_precision:
-            return
-            
-        self.weight_quantizer.set_precision(8, importance)
-        
-        # Use higher activation precision generally
-        act_importance = min(1.0, importance * 1.2)
-        self.activation_quantizer.set_precision(8, act_importance)
-        
-    def update_sparsity(self, importance: float, max_prune_ratio: float = 0.9) -> None:
-        """Update weight sparsity based on importance score"""
-        if not self.training or not self.dynamic_precision:
-            return
-            
-        # Calculate pruning ratio - less important layers get more pruning
-        target_prune_ratio = max_prune_ratio * (1.0 - importance)
-        
-        if abs(target_prune_ratio - self.pruned_ratio) < 0.05:
-            return  # Skip if change is minimal
-            
-        # Apply pruning
-        with torch.no_grad():
-            # Sort weights by absolute value
-            weight_abs = self.weight.abs().view(-1)
-            threshold_idx = int(weight_abs.numel() * target_prune_ratio)
-            if threshold_idx > 0:
-                threshold_value = torch.kthvalue(weight_abs, threshold_idx).values
-                
-                # Update sparsity mask (keep values above threshold)
-                self.sparsity_mask = self.weight.abs() > threshold_value
-                
-                # Track pruning ratio
-                self.pruned_ratio = 1.0 - self.sparsity_mask.float().mean().item()
-                
-    def get_importance(self, x: Optional[Tensor] = None) -> float:
-        """Get importance score for this layer"""
-        # Use provided estimator if available
-        if self.importance_estimator is not None:
-            if x is not None:
-                return self.importance_estimator(self, x)
-            else:
-                return self.importance_estimator(self)
-                
-        # Default heuristic based on weight statistics
-        with torch.no_grad():
-            weight_std = self.weight.std().item()
-            weight_abs_mean = self.weight.abs().mean().item()
-            
-            # Simple heuristic combining scale and sparsity
-            importance = (weight_abs_mean * 2 + weight_std) / 3
-            
-            # Normalize to 0-1 range (assuming typical values)
-            importance = min(1.0, importance / 0.1)
-            
-        return importance
-        
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass with quantization and conditional computation"""
-        # Get input importance for dynamic precision
-        if self.training and self.dynamic_precision:
-            importance = self.get_importance(x)
-            
-            # Update periodically to avoid overhead
-            current_time = time.time()
-            if current_time - self.last_importance_update > 10:  # Update every 10 seconds
-                self.update_precision(importance)
-                self.update_sparsity(importance)
-                self.last_importance_update = current_time
-        
-        # Apply quantization if enabled
-        if self.quantize and self.weight_quantizer is not None:
-            # Quantize weights and activations
-            weight = self.weight_quantizer(self.weight)
-            x = self.activation_quantizer(x)
-        else:
-            weight = self.weight
-            
-        # Apply sparsity mask for conditional computation
-        weight = weight * self.sparsity_mask
-        
-        # Linear operation
-        output = F.linear(x, weight, self.bias)
-        return output
-        
-    def extra_repr(self) -> str:
-        """Add quantization info to module representation"""
-        quantize_info = ""
-        if self.quantize and self.weight_quantizer is not None:
-            weight_bits = self.weight_quantizer.precision_bits
-            act_bits = self.activation_quantizer.precision_bits
-            quantize_info = f", weight_bits={weight_bits}, act_bits={act_bits}"
-            
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, pruned={self.pruned_ratio:.2f}{quantize_info}"
-
-# Fast, optimized version
-UltraQuantizedLinearNoBias = partial(UltraQuantizedLinear, bias=False)
-
-class AdaptiveCompressionEngine:
-    """
-    Advanced compression engine with multiple algorithms and automatic selection
-    based on content type and importance
-    """
     
-    ALGORITHMS = {
-        'svd': 'Singular Value Decomposition',
-        'tucker': 'Tucker Decomposition',
-        'pruning': 'Magnitude-based Pruning',
-        'quant': 'Quantization',
-        'sparse': 'Sparse Encoding',
-        'huffman': 'Huffman Coding'
-    }
+    def compute_content_hash(self, embedding: Tensor) -> str:
+        """Compute a content hash for deduplication"""
+        # Convert tensor to bytes and hash
+        tensor_bytes = embedding.detach().cpu().numpy().tobytes()
+        return hashlib.md5(tensor_bytes).hexdigest()
+
+class NeuroSymbolicCompression:
+    """
+    Advanced neural-symbolic compression system with semantic preservation
+    for extreme compression of tokens while maintaining retrievability
+    """
     
     def __init__(
         self,
-        default_algorithm: str = 'svd',
-        default_ratio: float = 0.5,
-        auto_select: bool = True,
-        min_tensor_size: int = 1000,
-        enable_mixed_algorithms: bool = True
+        model_dim: int,
+        base_ratio: float = 0.5,
+        distance_factor: float = 0.3,
+        max_ratio: float = 0.001,  # 0.1% of original size for distant tokens
+        block_size: int = 1024,
+        enable_mixed_precision: bool = True,
+        enable_semantic_compression: bool = True,
+        semantic_dim: int = 64,
+        precision_schedule: List[int] = [32, 16, 8, 4, 2, 1],
+        device: Optional[torch.device] = None,
+        kmeans_codebook_size: int = 1024,
+        enable_neural_compression: bool = True
     ):
-        self.default_algorithm = default_algorithm
-        self.default_ratio = default_ratio
-        self.auto_select = auto_select
-        self.min_tensor_size = min_tensor_size
-        self.enable_mixed_algorithms = enable_mixed_algorithms
+        self.model_dim = model_dim
+        self.base_ratio = base_ratio
+        self.distance_factor = distance_factor
+        self.max_ratio = max_ratio
+        self.block_size = block_size
+        self.enable_mixed_precision = enable_mixed_precision
+        self.enable_semantic_compression = enable_semantic_compression
+        self.semantic_dim = semantic_dim
+        self.precision_schedule = precision_schedule
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.kmeans_codebook_size = kmeans_codebook_size
+        self.enable_neural_compression = enable_neural_compression
         
-        # Algorithm selection heuristics
-        self.algorithm_performance = {algo: 1.0 for algo in self.ALGORITHMS}
+        # Statistics tracking
         self.compression_stats = defaultdict(list)
         
-    def _select_algorithm(self, tensor: Tensor, importance: float) -> str:
-        """Select best compression algorithm based on tensor properties and importance"""
-        if not self.auto_select:
-            return self.default_algorithm
+        # Initialize semantic encoder for knowledge distillation
+        if enable_semantic_compression:
+            self.semantic_encoder = nn.Sequential(
+                nn.Linear(model_dim, model_dim // 2),
+                nn.LayerNorm(model_dim // 2),
+                nn.GELU(),
+                nn.Linear(model_dim // 2, semantic_dim)
+            ).to(device)
             
-        # Skip selection for small tensors
-        if tensor.numel() < self.min_tensor_size:
-            return 'quant'  # Default to quantization for small tensors
-            
-        # Analyze tensor properties
-        sparsity = (tensor.abs() < 1e-6).float().mean().item()
-        variance = tensor.var().item()
-        rank_estimate = min(tensor.shape) / max(1, variance * 10)
-        
-        # Determine best algorithm based on tensor properties
-        if importance < 0.3:
-            # Low importance - aggressive compression
-            if sparsity > 0.7:
-                return 'sparse'
-            else:
-                return 'quant'
-        elif importance < 0.7:
-            # Medium importance
-            if rank_estimate < 0.2:
-                return 'svd'
-            elif sparsity > 0.5:
-                return 'sparse'
-            else:
-                return 'pruning'
+            self.semantic_decoder = nn.Sequential(
+                nn.Linear(semantic_dim, model_dim // 2),
+                nn.LayerNorm(model_dim // 2),
+                nn.GELU(),
+                nn.Linear(model_dim // 2, model_dim)
+            ).to(device)
         else:
-            # High importance - conservative compression
-            if rank_estimate < 0.3:
-                return 'svd'
-            else:
-                return 'quant'
-                
-    def compress_tensor(
+            self.semantic_encoder = None
+            self.semantic_decoder = None
+            
+        # Neural compression components
+        if enable_neural_compression:
+            # Sparse autoencoder for ultra-compression
+            self.neural_encoder = nn.Sequential(
+                nn.Linear(model_dim, model_dim // 4),
+                nn.LayerNorm(model_dim // 4),
+                nn.GELU(),
+                nn.Linear(model_dim // 4, model_dim // 16),
+                nn.LayerNorm(model_dim // 16),
+            ).to(device)
+            
+            self.neural_decoder = nn.Sequential(
+                nn.Linear(model_dim // 16, model_dim // 4),
+                nn.LayerNorm(model_dim // 4),
+                nn.GELU(),
+                nn.Linear(model_dim // 4, model_dim),
+            ).to(device)
+        else:
+            self.neural_encoder = None
+            self.neural_decoder = None
+            
+        # Create and initialize codebooks for vector quantization
+        self.initialize_codebooks()
+        
+    def initialize_codebooks(self):
+        """Initialize vector quantization codebooks"""
+        # Primary codebook for main token compression
+        self.primary_codebook = nn.Parameter(
+            torch.randn(self.kmeans_codebook_size, self.model_dim) * 0.01
+        )
+        
+        # Semantic codebook for semantic compression
+        if self.enable_semantic_compression:
+            self.semantic_codebook = nn.Parameter(
+                torch.randn(self.kmeans_codebook_size // 4, self.semantic_dim) * 0.01
+            )
+        
+        # Specialized codebooks for different token types/regions
+        self.specialized_codebooks = nn.ParameterDict({
+            "entity": nn.Parameter(torch.randn(self.kmeans_codebook_size // 8, self.model_dim) * 0.01),
+            "numeric": nn.Parameter(torch.randn(self.kmeans_codebook_size // 8, self.model_dim) * 0.01),
+            "syntactic": nn.Parameter(torch.randn(self.kmeans_codebook_size // 8, self.model_dim) * 0.01),
+        })
+        
+    def calculate_compression_ratio(
         self, 
-        tensor: Tensor, 
-        ratio: Optional[float] = None,
-        algorithm: Optional[str] = None,
-        importance: float = 0.5
-    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        token_distance: int, 
+        importance: float = 0.5,
+        tier: NeuralMemoryTier = NeuralMemoryTier.GENERAL
+    ) -> float:
         """
-        Compress a tensor using the selected algorithm
+        Calculate compression ratio based on token distance, importance, and tier
         
         Args:
-            tensor: Input tensor to compress
-            ratio: Compression ratio (0-1, lower means more compression)
-            algorithm: Compression algorithm to use
-            importance: Importance score for this tensor
+            token_distance: Distance in tokens from current position
+            importance: Token importance (0-1)
+            tier: Memory tier for contextual compression adjustment
             
         Returns:
-            Tuple of (compressed_tensors, metadata)
+            Compression ratio (1.0 = no compression, 0.001 = 99.9% compression)
         """
-        ratio = ratio or self.default_ratio
+        # Base ratio from distance with exponential decay
+        tier_factor = {
+            NeuralMemoryTier.FOCUS: 1.0,
+            NeuralMemoryTier.ACTIVE: 0.95,
+            NeuralMemoryTier.FOREGROUND: 0.8,
+            NeuralMemoryTier.BACKGROUND: 0.6,
+            NeuralMemoryTier.EPISODIC: 0.4,
+            NeuralMemoryTier.SEMANTIC: 0.3,
+            NeuralMemoryTier.GENERAL: 0.2,
+            NeuralMemoryTier.CATEGORICAL: 0.15,
+            NeuralMemoryTier.ARCHIVAL: 0.1,
+            NeuralMemoryTier.REFERENCE: 0.05,
+            NeuralMemoryTier.CONSOLIDATED: 0.02,
+            NeuralMemoryTier.OFFLOADED: 0.01,
+        }.get(tier, 0.2)
         
-        # Skip compression for small tensors
-        if tensor.numel() < self.min_tensor_size:
-            return {"data": tensor}, {"algorithm": "none", "ratio": 1.0}
-            
-        # Select algorithm if not specified
-        if algorithm is None:
-            algorithm = self._select_algorithm(tensor, importance)
-            
-        # Adjust ratio based on importance
-        adjusted_ratio = ratio * (0.5 + 0.5 * importance)
-        
-        # Apply selected compression algorithm
-        start_time = time.time()
-        
-        if algorithm == 'svd':
-            result = self._compress_svd(tensor, adjusted_ratio)
-        elif algorithm == 'tucker':
-            result = self._compress_tucker(tensor, adjusted_ratio)
-        elif algorithm == 'pruning':
-            result = self._compress_pruning(tensor, adjusted_ratio)
-        elif algorithm == 'quant':
-            result = self._compress_quantization(tensor, adjusted_ratio)
-        elif algorithm == 'sparse':
-            result = self._compress_sparse(tensor, adjusted_ratio)
+        # Calculate distance-based ratio 
+        if token_distance < 1000:
+            # Recent tokens get minimal compression
+            distance_ratio = 1.0
+        elif token_distance < 10000:
+            # Gradual compression within first 10K tokens
+            distance_ratio = self.base_ratio * math.exp(-self.distance_factor * token_distance / 10000)
+        elif token_distance < 100000:
+            # More aggressive for 10K-100K range
+            distance_ratio = self.base_ratio * math.exp(-self.distance_factor * token_distance / 10000) * 0.5
+        elif token_distance < 1000000:
+            # Very aggressive for 100K-1M range
+            distance_ratio = self.base_ratio * math.exp(-self.distance_factor * token_distance / 10000) * 0.2
         else:
-            # Fallback
-            result = {"data": tensor}, {"algorithm": "none", "ratio": 1.0}
+            # Maximum compression beyond 1M distance
+            distance_ratio = self.base_ratio * math.exp(-self.distance_factor * token_distance / 10000) * 0.1
+        
+        # Adjust by importance (higher importance = less compression)
+        importance_factor = 0.2 + (importance * 0.8)  # Range: 0.2-1.0
+        
+        # Combine all factors
+        final_ratio = max(self.max_ratio, distance_ratio * importance_factor * tier_factor)
+        
+        return final_ratio
+    
+    def determine_precision(self, token_distance: int, importance: float) -> int:
+        """
+        Determine bit precision based on token distance and importance
+        
+        Args:
+            token_distance: Distance in tokens from current position
+            importance: Token importance (0-1)
             
-        # Record compression stats
-        compressed_size = sum(t.numel() * t.element_size() for t in result[0].values())
-        original_size = tensor.numel() * tensor.element_size()
-        actual_ratio = compressed_size / original_size
+        Returns:
+            Bit precision (32, 16, 8, 4, 2, or 1)
+        """
+        if not self.enable_mixed_precision:
+            return 32
         
-        elapsed_time = time.time() - start_time
+        # Increase precision based on importance
+        importance_boost = math.floor(importance * 3)  # 0-2 levels boost
+            
+        # Base precision selection on distance and boost by importance
+        if token_distance < 1000:
+            precision_idx = 0  # 32-bit
+        elif token_distance < 10000:
+            precision_idx = 1  # 16-bit
+        elif token_distance < 100000:
+            precision_idx = 2  # 8-bit
+        elif token_distance < 1000000:
+            precision_idx = 3  # 4-bit
+        elif token_distance < 10000000:
+            precision_idx = 4  # 2-bit
+        else:
+            precision_idx = 5  # 1-bit
+            
+        # Apply importance boost (but don't exceed highest precision)
+        precision_idx = max(0, precision_idx - importance_boost)
         
-        self.compression_stats[algorithm].append({
-            "original_size": original_size,
-            "compressed_size": compressed_size,
-            "actual_ratio": actual_ratio,
-            "target_ratio": adjusted_ratio,
-            "time": elapsed_time
-        })
+        return self.precision_schedule[precision_idx]
+
+    def _compress_neural(
+        self, 
+        tensor: Tensor,
+        ratio: float
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """Compress using neural networks for adaptive compression"""
+        if not self.enable_neural_compression or self.neural_encoder is None:
+            # Fall back to SVD if neural compression not available
+            return self._compress_svd(tensor, ratio)
+            
+        # Get original metadata
+        original_shape = tensor.shape
         
-        # Update metadata
-        result[1].update({
-            "actual_ratio": actual_ratio,
-            "target_ratio": adjusted_ratio,
-            "time": elapsed_time
-        })
+        # If tensor is not already on the target device, move it
+        tensor = tensor.to(self.device)
         
-        return result
+        # Apply neural encoder
+        encoded = self.neural_encoder(tensor)
         
-    def decompress_tensor(
-        self,
-        compressed_tensors: Dict[str, Tensor],
+        # Apply sparsity based on ratio (only keep top k% values)
+        k = max(1, int(encoded.numel() * ratio))
+        values, indices = torch.topk(encoded.abs().flatten(), k)
+        threshold = values.min()
+        
+        # Create sparse mask
+        mask = encoded.abs() >= threshold
+        sparse_encoded = encoded * mask
+        
+        return {
+            "encoded": sparse_encoded,
+            "mask": mask
+        }, {
+            "algorithm": "neural",
+            "original_shape": original_shape,
+            "ratio": ratio,
+            "sparsity": 1.0 - (k / encoded.numel())
+        }
+    
+    def _decompress_neural(
+        self, 
+        compressed_data: Dict[str, Tensor],
         metadata: Dict[str, Any]
     ) -> Tensor:
-        """
-        Decompress a tensor that was compressed with this engine
+        """Decompress neural-compressed tensor"""
+        encoded = compressed_data["encoded"]
         
-        Args:
-            compressed_tensors: Dictionary of compressed tensor components
-            metadata: Compression metadata
+        # Apply neural decoder
+        decoded = self.neural_decoder(encoded)
+        
+        # Reshape to original shape if needed
+        original_shape = metadata.get("original_shape")
+        if original_shape and tuple(decoded.shape) != tuple(original_shape):
+            decoded = decoded.reshape(original_shape)
             
-        Returns:
-            Decompressed tensor
-        """
-        algorithm = metadata.get("algorithm", "none")
+        return decoded
         
-        if algorithm == "none":
-            return compressed_tensors["data"]
-        elif algorithm == "svd":
-            return self._decompress_svd(compressed_tensors, metadata)
-        elif algorithm == "tucker":
-            return self._decompress_tucker(compressed_tensors, metadata)
-        elif algorithm == "pruning":
-            return self._decompress_pruning(compressed_tensors, metadata)
-        elif algorithm == "quant":
-            return self._decompress_quantization(compressed_tensors, metadata)
-        elif algorithm == "sparse":
-            return self._decompress_sparse(compressed_tensors, metadata)
+    def _compress_semantic(
+        self, 
+        tensor: Tensor,
+        ratio: float
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """Distill semantic information into compact representation"""
+        if not self.enable_semantic_compression or self.semantic_encoder is None:
+            # Fall back to SVD if semantic compression not available
+            return self._compress_svd(tensor, ratio)
+            
+        # Get original metadata
+        original_shape = tensor.shape
+        
+        # If tensor is not already on the target device, move it
+        tensor = tensor.to(self.device)
+        
+        # Apply semantic encoder
+        semantic = self.semantic_encoder(tensor)
+        
+        # Quantize the semantic vector for extreme compression
+        if hasattr(self, 'semantic_codebook'):
+            # Compute distances to codebook vectors
+            distances = torch.cdist(semantic.unsqueeze(0), self.semantic_codebook.unsqueeze(0))[0]
+            
+            # Find nearest codebook vector
+            indices = torch.argmin(distances, dim=1)
+            
+            return {
+                "indices": indices,
+            }, {
+                "algorithm": "semantic_vq",
+                "original_shape": original_shape,
+                "ratio": ratio
+            }
         else:
-            raise ValueError(f"Unknown compression algorithm: {algorithm}")
+            return {
+                "semantic": semantic,
+            }, {
+                "algorithm": "semantic",
+                "original_shape": original_shape,
+                "ratio": ratio
+            }
+    
+    def _decompress_semantic(
+        self, 
+        compressed_data: Dict[str, Tensor],
+        metadata: Dict[str, Any]
+    ) -> Tensor:
+        """Expand semantic representation back to full embedding"""
+        algorithm = metadata.get("algorithm", "")
         
-    def _compress_svd(self, tensor: Tensor, ratio: float) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
-        """Compress tensor using truncated SVD"""
+        if algorithm == "semantic_vq":
+            # Get the codebook vectors from indices
+            indices = compressed_data["indices"]
+            semantic = self.semantic_codebook[indices]
+        else:
+            semantic = compressed_data["semantic"]
+        
+        # Apply semantic decoder
+        decoded = self.semantic_decoder(semantic)
+        
+        # Reshape to original shape if needed
+        original_shape = metadata.get("original_shape")
+        if original_shape and tuple(decoded.shape) != tuple(original_shape):
+            decoded = decoded.reshape(original_shape)
+            
+        return decoded
+        
+    def _compress_vector_quantization(
+        self, 
+        tensor: Tensor,
+        ratio: float,
+        token_type: int = 0
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """Compress using vector quantization with learned codebooks"""
+        # Get original metadata
+        original_shape = tensor.shape
+        
+        # If tensor is not already on the target device, move it
+        tensor = tensor.to(self.device)
+        
+        # Select appropriate codebook based on token type
+        if token_type == 1 and "entity" in self.specialized_codebooks:
+            codebook = self.specialized_codebooks["entity"]
+        elif token_type == 2 and "numeric" in self.specialized_codebooks:
+            codebook = self.specialized_codebooks["numeric"]
+        elif token_type == 3 and "syntactic" in self.specialized_codebooks:
+            codebook = self.specialized_codebooks["syntactic"]
+        else:
+            codebook = self.primary_codebook
+        
+        # Compute distances to codebook vectors
+        distances = torch.cdist(tensor.unsqueeze(0), codebook.unsqueeze(0))[0]
+        
+        # Find nearest codebook vector
+        indices = torch.argmin(distances, dim=1)
+        
+        return {
+            "indices": indices,
+            "codebook_id": token_type if token_type in [1, 2, 3] else 0
+        }, {
+            "algorithm": "vq",
+            "original_shape": original_shape,
+            "ratio": ratio
+        }
+    
+    def _decompress_vector_quantization(
+        self, 
+        compressed_data: Dict[str, Tensor],
+        metadata: Dict[str, Any]
+    ) -> Tensor:
+        """Decompress vector-quantized tensor"""
+        indices = compressed_data["indices"]
+        codebook_id = compressed_data.get("codebook_id", 0)
+        
+        # Select the appropriate codebook
+        if codebook_id == 1 and "entity" in self.specialized_codebooks:
+            codebook = self.specialized_codebooks["entity"]
+        elif codebook_id == 2 and "numeric" in self.specialized_codebooks:
+            codebook = self.specialized_codebooks["numeric"]
+        elif codebook_id == 3 and "syntactic" in self.specialized_codebooks:
+            codebook = self.specialized_codebooks["syntactic"]
+        else:
+            codebook = self.primary_codebook
+        
+        # Get the codebook vectors
+        reconstructed = codebook[indices]
+        
+        # Reshape to original shape if needed
+        original_shape = metadata.get("original_shape")
+        if original_shape and tuple(reconstructed.shape) != tuple(original_shape):
+            reconstructed = reconstructed.reshape(original_shape)
+            
+        return reconstructed
+    
+    def _compress_svd(
+        self, 
+        tensor: Tensor, 
+        ratio: float
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """Compress tensor using truncated SVD with adaptive rank"""
         original_shape = tensor.shape
         
         # For tensors with more than 2 dimensions, reshape to 2D
@@ -1179,24 +581,10 @@ class AdaptiveCompressionEngine:
             U, S, V = torch.svd(tensor)
             
             # Determine rank based on compression ratio
-            n_components = max(1, min(tensor.shape) - 1)
-            target_size = int(tensor.numel() * ratio)
+            max_rank = min(tensor.shape)
             
-            # Binary search to find optimal rank
-            low, high = 1, min(tensor.shape)
-            best_rank = 1
-            
-            while low <= high:
-                mid = (low + high) // 2
-                compressed_size = mid * sum(tensor.shape)
-                
-                if compressed_size <= target_size:
-                    best_rank = mid
-                    low = mid + 1
-                else:
-                    high = mid - 1
-                    
-            rank = best_rank
+            # Ensure we keep at least one component
+            rank = max(1, min(max_rank, int(max_rank * ratio)))
             
             # Truncate to specified rank
             U_truncated = U[:, :rank]
@@ -1210,140 +598,47 @@ class AdaptiveCompressionEngine:
             }, {
                 "algorithm": "svd",
                 "original_shape": original_shape,
-                "rank": rank
+                "rank": rank,
+                "ratio": ratio
             }
         except Exception as e:
             logger.warning(f"SVD compression failed: {e}, falling back to original tensor")
             return {"data": tensor}, {"algorithm": "none", "error": str(e)}
             
-    def _decompress_svd(
-        self,
-        compressed_tensors: Dict[str, Tensor],
-        metadata: Dict[str, Any]
-    ) -> Tensor:
-        """Decompress tensor from SVD components"""
-        U = compressed_tensors["U"]
-        S = compressed_tensors["S"]
-        V = compressed_tensors["V"]
-        
-        # Reconstruct tensor
-        reconstructed = torch.matmul(U * S.unsqueeze(0), V.t())
-        
-        # Reshape back to original shape if needed
-        original_shape = metadata.get("original_shape")
-        if original_shape is not None and tuple(reconstructed.shape) != tuple(original_shape):
-            reconstructed = reconstructed.reshape(original_shape)
-            
-        return reconstructed
-        
-    def _compress_tucker(self, tensor: Tensor, ratio: float) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
-        """Compress tensor using Tucker decomposition"""
-        # This is a simplified version without actual tensor decomposition library
-        # In a real implementation, we would use tensorly or a custom implementation
-        
-        # For demonstration purposes, we'll just use SVD on each mode
-        original_shape = tensor.shape
-        
-        if tensor.dim() <= 2:
-            # For 1D or 2D tensors, use SVD instead
-            return self._compress_svd(tensor, ratio)
-            
-        # Determine ranks based on ratio (simplified)
-        ranks = [max(1, int(s * ratio)) for s in tensor.shape]
-        
-        # Just return the original tensor for now
-        # In a real implementation, we would compute the actual Tucker decomposition
-        return {"data": tensor}, {
-            "algorithm": "tucker", 
-            "original_shape": original_shape,
-            "ranks": ranks
-        }
-        
-    def _decompress_tucker(
-        self,
-        compressed_tensors: Dict[str, Tensor],
-        metadata: Dict[str, Any]
-    ) -> Tensor:
-        """Decompress tensor from Tucker components"""
-        # In a real implementation, we would perform the actual reconstruction
-        return compressed_tensors["data"]
-        
-    def _compress_pruning(self, tensor: Tensor, ratio: float) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
-        """Compress tensor using magnitude-based pruning"""
-        original_shape = tensor.shape
-        
-        # Determine threshold based on ratio
-        tensor_flat = tensor.abs().reshape(-1)
-        k = int(tensor.numel() * (1 - ratio))
-        if k >= tensor.numel():
-            # No pruning needed
-            return {"data": tensor}, {"algorithm": "none"}
-            
-        # Find threshold value
-        threshold = torch.kthvalue(tensor_flat, k).values
-        
-        # Create mask and apply
-        mask = tensor.abs() > threshold
-        pruned_tensor = tensor * mask
-        
-        # Convert to sparse if sparsity is high enough
-        sparsity = 1.0 - mask.float().mean().item()
-        if sparsity > 0.7:
-            indices = mask.nonzero()
-            values = pruned_tensor[mask]
-            
-            return {
-                "indices": indices,
-                "values": values
-            }, {
-                "algorithm": "pruning",
-                "original_shape": original_shape,
-                "sparse": True,
-                "sparsity": sparsity
-            }
-        else:
-            return {"data": pruned_tensor}, {
-                "algorithm": "pruning",
-                "original_shape": original_shape,
-                "sparse": False,
-                "sparsity": sparsity
-            }
-            
-    def _decompress_pruning(
-        self,
-        compressed_tensors: Dict[str, Tensor],
-        metadata: Dict[str, Any]
-    ) -> Tensor:
-        """Decompress tensor from pruned representation"""
-        if metadata.get("sparse", False):
-            indices = compressed_tensors["indices"]
-            values = compressed_tensors["values"]
-            
-            # Create sparse tensor
-            output = torch.zeros(metadata["original_shape"], 
-                              device=indices.device, dtype=values.dtype)
-            output.index_put_(tuple(indices.t()), values)
-            return output
-        else:
-            return compressed_tensors["data"]
-            
-    def _compress_quantization(self, tensor: Tensor, ratio: float) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
-        """Compress tensor using quantization"""
+    def _compress_quantization(
+        self, 
+        tensor: Tensor, 
+        ratio: float,
+        bits: int
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """Compress tensor using ultra-low bit quantization"""
         original_shape = tensor.shape
         dtype = tensor.dtype
         
-        # Determine number of bits based on ratio
-        bits = max(1, min(8, int(32 * ratio)))
+        # Ensure bits is valid (1, 2, 4, 8, 16)
+        bits = min(16, max(1, bits))
         
         # Compute min and max
         min_val = tensor.min()
         max_val = tensor.max()
+        
+        # Handle special case where min == max
+        if min_val == max_val:
+            return {"data": torch.zeros_like(tensor), "value": min_val.unsqueeze(0)}, {
+                "algorithm": "const",
+                "original_shape": original_shape
+            }
+            
         scale = (max_val - min_val) / ((1 << bits) - 1)
         scale = max(scale, 1e-10)  # Avoid division by zero
         
         # Quantize
         tensor_normalized = ((tensor - min_val) / scale).round().clamp(0, (1 << bits) - 1)
-        quantized = tensor_normalized.to(torch.uint8) if bits <= 8 else tensor_normalized
+        
+        if bits <= 8:
+            quantized = tensor_normalized.to(torch.uint8)
+        else:
+            quantized = tensor_normalized.to(torch.int16)
         
         return {
             "data": quantized,
@@ -1353,45 +648,35 @@ class AdaptiveCompressionEngine:
             "algorithm": "quant",
             "original_shape": original_shape,
             "original_dtype": dtype,
-            "bits": bits
+            "bits": bits,
+            "ratio": ratio
         }
         
-    def _decompress_quantization(
-        self,
-        compressed_tensors: Dict[str, Tensor],
-        metadata: Dict[str, Any]
-    ) -> Tensor:
-        """Decompress tensor from quantized representation"""
-        quantized = compressed_tensors["data"]
-        min_val = compressed_tensors["min"]
-        scale = compressed_tensors["scale"]
-        
-        # Dequantize
-        dequantized = quantized.to(torch.float32) * scale + min_val
-        
-        # Convert back to original dtype
-        original_dtype = metadata.get("original_dtype", torch.float32)
-        return dequantized.to(original_dtype)
-        
-    def _compress_sparse(self, tensor: Tensor, ratio: float) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
-        """Compress tensor using sparse encoding"""
+    def _compress_sparse(
+        self, 
+        tensor: Tensor, 
+        ratio: float
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """Compress tensor using extreme sparsity"""
         original_shape = tensor.shape
         
-        # Determine sparsity based on ratio
-        target_nonzeros = int(tensor.numel() * ratio)
+        # Determine sparsity based on ratio (higher ratio = more values kept)
+        target_nonzeros = max(1, int(tensor.numel() * ratio))
         
-        # Find indices of largest magnitude values
-        if target_nonzeros < tensor.numel():
-            tensor_flat = tensor.abs().reshape(-1)
-            threshold_idx = tensor.numel() - target_nonzeros
-            threshold = torch.kthvalue(tensor_flat, threshold_idx).values
+        # Find threshold for top values
+        tensor_flat = tensor.abs().reshape(-1)
+        
+        # Find the kth largest value as threshold
+        if target_nonzeros < tensor_flat.numel():
+            threshold_idx = tensor_flat.numel() - target_nonzeros
+            threshold_value = torch.kthvalue(tensor_flat, threshold_idx).values
             
-            # Create sparse tensor
-            mask = tensor.abs() > threshold
+            # Create sparse tensor - keep only values above threshold
+            mask = tensor.abs() > threshold_value
             indices = mask.nonzero()
             values = tensor[mask]
         else:
-            # Convert to COO format directly
+            # Keep all values
             indices = tensor.nonzero()
             values = tensor[indices[:, 0], indices[:, 1]] if tensor.dim() == 2 else tensor[tuple(indices.t())]
             
@@ -1400,1976 +685,4378 @@ class AdaptiveCompressionEngine:
             "values": values
         }, {
             "algorithm": "sparse",
-            "original_shape": original_shape
+            "original_shape": original_shape,
+            "ratio": ratio,
+            "sparsity": 1.0 - (values.numel() / tensor.numel())
         }
+    
+    def _compress_noop(
+        self, 
+        tensor: Tensor
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """No-op compression (just returns the original tensor)"""
+        return {"data": tensor}, {"algorithm": "noop", "original_shape": tensor.shape}
+
+    def compress_token(
+        self, 
+        embedding: Tensor,
+        token_distance: int,
+        importance: float = 0.5,
+        token_type: int = 0,
+        tier: NeuralMemoryTier = NeuralMemoryTier.GENERAL
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        """
+        Compress a token embedding with optimal algorithm selection
         
-    def _decompress_sparse(
-        self,
-        compressed_tensors: Dict[str, Tensor],
+        Args:
+            embedding: Token embedding tensor
+            token_distance: Distance from current position
+            importance: Token importance score (0-1)
+            token_type: Type of token (used for specialized compression)
+            tier: Memory tier for contextual compression
+            
+        Returns:
+            Tuple of (compressed_data, metadata)
+        """
+        # Determine compression parameters
+        ratio = self.calculate_compression_ratio(token_distance, importance, tier)
+        precision = self.determine_precision(token_distance, importance)
+        
+        # For very close tokens, skip compression
+        if token_distance < 1000 and tier in [NeuralMemoryTier.FOCUS, NeuralMemoryTier.ACTIVE]:
+            return self._compress_noop(embedding)
+        
+        # Select compression algorithm based on distance and token properties
+        if token_distance > 1000000 or tier in [NeuralMemoryTier.CONSOLIDATED, NeuralMemoryTier.SEMANTIC]:
+            # For extremely distant tokens, use semantic compression
+            if self.enable_semantic_compression:
+                return self._compress_semantic(embedding, ratio)
+            else:
+                # Fallback to vector quantization for extreme distances
+                return self._compress_vector_quantization(embedding, ratio, token_type)
+        elif token_distance > 100000 or tier in [NeuralMemoryTier.CATEGORICAL, NeuralMemoryTier.ARCHIVAL]:
+            # For very distant tokens, use vector quantization
+            return self._compress_vector_quantization(embedding, ratio, token_type)
+        elif token_distance > 10000 or tier in [NeuralMemoryTier.EPISODIC, NeuralMemoryTier.GENERAL]:
+            # For moderately distant tokens, use quantization
+            return self._compress_quantization(embedding, ratio, precision)
+        elif token_distance > 1000 or tier in [NeuralMemoryTier.BACKGROUND]:
+            # For semi-distant tokens, use SVD or neural compression
+            if self.enable_neural_compression and importance > 0.7:
+                return self._compress_neural(embedding, ratio)
+            else:
+                return self._compress_svd(embedding, ratio)
+        else:
+            # For close tokens, use no compression or light SVD
+            if ratio > 0.9:
+                return self._compress_noop(embedding)
+            else:
+                return self._compress_svd(embedding, ratio)
+    
+    def decompress_token(
+        self, 
+        compressed_data: Dict[str, Tensor],
         metadata: Dict[str, Any]
     ) -> Tensor:
-        """Decompress tensor from sparse representation"""
-        indices = compressed_tensors["indices"]
-        values = compressed_tensors["values"]
-        original_shape = metadata["original_shape"]
+        """Decompress a token embedding"""
+        algorithm = metadata.get("algorithm", "none")
         
-        # Reconstruct tensor
-        output = torch.zeros(original_shape, device=indices.device, dtype=values.dtype)
-        output.index_put_(tuple(indices.t()), values)
-        
-        return output
-
-##############################################
-# Ultra-scalable attention mechanisms        #
-##############################################
-
-class UltraSparseAttention(nn.Module):
-    """
-    Advanced sparse attention mechanism with O(n log n) scaling properties
-    for handling extreme context windows (100K+ tokens)
-    """
-    def __init__(
-        self,
-        dim: int,
-        heads: int = 8,
-        dim_head: Optional[int] = None,
-        causal: bool = True,
-        max_seq_len: int = 102400,  # 100K default
-        top_k: Optional[int] = None,
-        sliding_window: Optional[int] = None,
-        blocksize: int = 64,
-        dropout: float = 0.0,
-        attention_scale: float = 1.0,
-        quantize: bool = False,
-        memory_efficient: bool = True
-    ):
-        super().__init__()
-        self.dim = dim
-        self.heads = heads
-        self.causal = causal
-        self.max_seq_len = max_seq_len
-        self.top_k = top_k
-        self.sliding_window = sliding_window
-        self.blocksize = blocksize
-        self.attention_scale = attention_scale
-        self.quantize = quantize
-        self.memory_efficient = memory_efficient
-        
-        # Set dimension per head
-        dim_head = dim_head or (dim // heads)
-        inner_dim = dim_head * heads
-        
-        # Linear projections
-        linear_cls = UltraQuantizedLinear if quantize else nn.Linear
-        
-        self.to_q = linear_cls(dim, inner_dim, bias=False)
-        self.to_k = linear_cls(dim, inner_dim, bias=False)
-        self.to_v = linear_cls(dim, inner_dim, bias=False)
-        self.to_out = linear_cls(inner_dim, dim, bias=False)
-        
-        # Attention dropout
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        
-        # Optional normalization
-        self.norm_q = nn.LayerNorm(dim_head)
-        self.norm_k = nn.LayerNorm(dim_head)
-        
-        # Sparse attention parameters
-        self.pos_bias = nn.Parameter(torch.zeros(max_seq_len)) if sliding_window is None else None
-        
-        # Block sparse implementation
-        if blocksize > 0:
-            self.block_sparse = True
-            self.block_size = blocksize
+        if algorithm == "noop":
+            return compressed_data["data"]
+        elif algorithm == "svd":
+            # Reconstruct from SVD components
+            U = compressed_data["U"]
+            S = compressed_data["S"]
+            V = compressed_data["V"]
+            
+            # Reconstruct
+            reconstructed = torch.matmul(U * S.unsqueeze(0), V.t())
+            
+            # Reshape to original shape if needed
+            original_shape = metadata.get("original_shape")
+            if original_shape and tuple(reconstructed.shape) != tuple(original_shape):
+                reconstructed = reconstructed.reshape(original_shape)
+                
+            return reconstructed
+        elif algorithm == "quant":
+            # Dequantize
+            data = compressed_data["data"]
+            min_val = compressed_data["min"]
+            scale = compressed_data["scale"]
+            
+            # Convert to float and rescale
+            dequantized = data.float() * scale + min_val
+            
+            # Reshape if needed
+            original_shape = metadata.get("original_shape")
+            if original_shape and tuple(dequantized.shape) != tuple(original_shape):
+                dequantized = dequantized.reshape(original_shape)
+                
+            # Convert back to original dtype
+            original_dtype = metadata.get("original_dtype", torch.float32)
+            return dequantized.to(original_dtype)
+        elif algorithm == "sparse":
+            # Reconstruct sparse tensor
+            indices = compressed_data["indices"]
+            values = compressed_data["values"]
+            original_shape = metadata["original_shape"]
+            
+            # Create output tensor
+            output = torch.zeros(original_shape, device=indices.device, dtype=values.dtype)
+            
+            # Populate with values
+            if indices.shape[0] > 0:  # Check if there are any indices
+                output.index_put_(tuple(indices.t()), values)
+                
+            return output
+        elif algorithm == "const":
+            # Constant value tensor
+            value = compressed_data["value"]
+            shape = metadata["original_shape"]
+            return torch.full(shape, value, device=value.device, dtype=value.dtype)
+        elif algorithm == "neural":
+            # Neural network decompression
+            return self._decompress_neural(compressed_data, metadata)
+        elif algorithm == "semantic" or algorithm == "semantic_vq":
+            # Semantic decompression
+            return self._decompress_semantic(compressed_data, metadata)
+        elif algorithm == "vq":
+            # Vector quantization decompression
+            return self._decompress_vector_quantization(compressed_data, metadata)
         else:
-            self.block_sparse = False
-            
-        # Fixed RPE
-        if self.sliding_window:
-            # Create relative position encoding
-            self.rel_pos_bias = nn.Parameter(torch.zeros(2 * sliding_window + 1))
-            self.register_buffer('rel_pos_indices', torch.arange(-sliding_window, sliding_window+1))
-            
-    def get_attn_pattern(self, seq_len: int) -> Tensor:
-        """Get the sparse attention pattern for a given sequence length"""
-        device = self.to_q.weight.device
-        
-        if self.sliding_window is not None:
-            # Sliding window sparsity pattern
-            return self._get_sliding_window_mask(seq_len, device)
-        elif self.block_sparse:
-            # Block sparse pattern
-            return self._get_block_sparse_mask(seq_len, device)
-        else:
-            # Full attention (dense)
-            return torch.ones(seq_len, seq_len, device=device).bool()
-            
-    def _get_sliding_window_mask(self, seq_len: int, device: torch.device) -> Tensor:
-        """Create sliding window attention mask"""
-        window = self.sliding_window
-        row_idx = torch.arange(seq_len, device=device).unsqueeze(1)
-        col_idx = torch.arange(seq_len, device=device).unsqueeze(0)
-        mask = (row_idx - col_idx).abs() <= window
-        
-        # Add causal constraint if needed
-        if self.causal:
-            causal_mask = col_idx <= row_idx
-            mask = mask & causal_mask
-            
-        return mask
-        
-    def _get_block_sparse_mask(self, seq_len: int, device: torch.device) -> Tensor:
-        """Create block sparse attention mask"""
-        block_size = self.blocksize
-        num_blocks = math.ceil(seq_len / block_size)
-        
-        # Create block pattern
-        block_mask = torch.ones(num_blocks, num_blocks, device=device).bool()
-        
-        # Apply causality at block level if needed
-        if self.causal:
-            block_idx = torch.arange(num_blocks, device=device)
-            causal_block_mask = block_idx.unsqueeze(0) >= block_idx.unsqueeze(1)
-            block_mask = block_mask & causal_block_mask
-            
-        # Expand to token level
-        row_blocks = torch.div(torch.arange(seq_len, device=device), block_size, rounding_mode='floor')
-        col_blocks = torch.div(torch.arange(seq_len, device=device), block_size, rounding_mode='floor')
-        
-        mask = block_mask[row_blocks.unsqueeze(1), col_blocks.unsqueeze(0)]
-        
-        # Add causal constraint at token level if needed
-        if self.causal:
-            token_idx = torch.arange(seq_len, device=device)
-            causal_mask = token_idx.unsqueeze(0) <= token_idx.unsqueeze(1)
-            mask = mask & causal_mask
-            
-        return mask
-        
-    def forward(
-        self,
-        x: Tensor,
-        mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        pos_bias: Optional[Tensor] = None
-    ) -> Tensor:
-        """
-        Forward pass with sparse attention
-        
-        Args:
-            x: Input tensor of shape (batch, seq_len, dim)
-            mask: Optional attention mask
-            context: Optional context for cross-attention
-            pos_bias: Optional positional bias
-            
-        Returns:
-            Output tensor of shape (batch, seq_len, dim)
-        """
-        b, n, d = x.shape
-        h = self.heads
-        
-        context = context if context is not None else x
-        
-        # Project queries, keys, values
-        q = self.to_q(x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        
-        # Split heads
-        q = rearrange(q, 'b n (h d) -> b h n d', h=h)
-        k = rearrange(k, 'b n (h d) -> b h n d', h=h)
-        v = rearrange(v, 'b n (h d) -> b h n d', h=h)
-        
-        # Apply normalization if needed
-        q = self.norm_q(q)
-        k = self.norm_k(k)
-        
-        # Get context length
-        context_len = k.shape[2]
-        
-        # Scale queries
-        q = q * (self.dim ** -0.5 * self.attention_scale)
-        
-        # Memory-efficient attention dispatch based on sequence length
-        if self.memory_efficient and n * context_len > 16384:  # Threshold for using sparse attention
-            # Get sparse attention pattern
-            sparse_mask = self.get_attn_pattern(context_len)
-            
-            # Apply user-provided mask if any
-            if mask is not None:
-                if mask.dim() == 2:  # (b, n) boolean mask
-                    mask = rearrange(mask, 'b n -> b 1 n 1')
-                    mask = mask & mask.transpose(-2, -1)
-                sparse_mask = sparse_mask & mask
-                
-            # Compute sparse attention efficiently
-            q_idx, k_idx = sparse_mask.nonzero(as_tuple=True)
-            
-            # Gather relevant query and key vectors
-            q_select = q[:, :, q_idx]  # b h nnz d
-            k_select = k[:, :, k_idx]  # b h nnz d
-            
-            # Compute attention scores for sparse pairs
-            scores = einsum('bhid,bhjd->bhij', q_select, k_select)
-            
-            # Apply relative positional bias if needed
-            if self.sliding_window is not None:
-                rel_pos = k_idx.unsqueeze(1) - q_idx.unsqueeze(0)  # nnz nnz
-                rel_pos = torch.clamp(rel_pos, -self.sliding_window, self.sliding_window)
-                rel_pos_indices = rel_pos + self.sliding_window
-                bias = self.rel_pos_bias[rel_pos_indices]
-                scores = scores + bias
-                
-            # Softmax normalization (per query position)
-            attn = F.softmax(scores, dim=-1)
-            attn = self.attn_dropout(attn)
-            
-            # Apply attention to values
-            v_select = v[:, :, k_idx]  # b h nnz d
-            out = einsum('bhij,bhjd->bhid', attn, v_select)
-            
-            # Scatter back to full output tensor
-            output = torch.zeros_like(q)
-            output[:, :, q_idx] = out
-        else:
-            # Use dense attention for shorter sequences
-            scores = einsum('b h i d, b h j d -> b h i j', q, k)
-            
-            # Apply causal mask if needed
-            if self.causal:
-                i, j = torch.triu_indices(n, context_len, offset=1, device=x.device)
-                scores[:, :, i, j] = -torch.finfo(scores.dtype).max
-                
-            # Add sliding window relative positional bias if enabled
-            if self.sliding_window is not None and pos_bias is None:
-                # Generate relative position indices
-                i = torch.arange(n, device=x.device).unsqueeze(1)
-                j = torch.arange(context_len, device=x.device).unsqueeze(0)
-                rel_pos = j - i
-                rel_pos = torch.clamp(rel_pos, -self.sliding_window, self.sliding_window)
-                rel_pos_indices = rel_pos + self.sliding_window
-                pos_bias = self.rel_pos_bias[rel_pos_indices]
-                
-            # Add positional bias if provided
-            if pos_bias is not None:
-                scores = scores + pos_bias
-                
-            # Apply attention mask if provided
-            if mask is not None:
-                scores = scores.masked_fill(~mask, -torch.finfo(scores.dtype).max)
-                
-            # Apply top-k sparsification if enabled
-            if self.top_k is not None and self.top_k < context_len:
-                top_k = min(self.top_k, context_len)
-                top_k_scores, top_k_indices = scores.topk(top_k, dim=-1)
-                
-                # Create new attention pattern from top-k
-                new_scores = torch.zeros_like(scores).fill_(-torch.finfo(scores.dtype).max)
-                new_scores.scatter_(-1, top_k_indices, top_k_scores)
-                scores = new_scores
-                
-            # Softmax attention
-            attn = F.softmax(scores, dim=-1)
-            attn = self.attn_dropout(attn)
-            
-            # Apply attention to values
-            output = einsum('b h i j, b h j d -> b h i d', attn, v)
-            
-        # Combine heads and project back to original dimension
-        output = rearrange(output, 'b h n d -> b n (h d)')
-        output = self.to_out(output)
-        output = self.resid_dropout(output)
-        
-        return output
-
-class HierarchicalMultiScaleAttention(nn.Module):
-    """
-    Multi-scale hierarchical attention with adaptive granularity 
-    for efficiently processing ultra-long sequences
-    """
-    def __init__(
-        self,
-        dim: int,
-        heads: int = 8,
-        dim_head: Optional[int] = None,
-        num_hierarchies: int = 3,
-        base_window_size: int = 512,
-        window_multiplier: int = 4,
-        causal: bool = True,
-        dropout: float = 0.0,
-        quantize: bool = False,
-        routes: int = 4,  # Number of routing options
-        token_clusters: Optional[int] = None  # Optional semantic clustering
-    ):
-        super().__init__()
-        self.dim = dim
-        self.heads = heads
-        self.causal = causal
-        self.num_hierarchies = num_hierarchies
-        self.base_window_size = base_window_size
-        self.window_multiplier = window_multiplier
-        self.routes = routes
-        self.token_clusters = token_clusters
-        
-        # Create attention modules for each hierarchy level
-        dim_head = dim_head or (dim // heads)
-        inner_dim = dim_head * heads
-        
-        self.attentions = nn.ModuleList([
-            UltraSparseAttention(
-                dim=dim,
-                heads=heads // num_hierarchies or 1,  # Distribute heads
-                dim_head=dim_head,
-                causal=causal,
-                sliding_window=base_window_size * (window_multiplier ** i),
-                dropout=dropout,
-                quantize=quantize
-            )
-            for i in range(num_hierarchies)
-        ])
-        
-        # Router network to determine which hierarchy should process each token
-        self.router = nn.Sequential(
-            nn.Linear(dim, dim // 4),
-            nn.LayerNorm(dim // 4),
-            nn.GELU(),
-            nn.Linear(dim // 4, routes * num_hierarchies)
-        )
-        
-        # Route combiner
-        self.route_combiner = nn.Linear(inner_dim, dim)
-        
-        # Token clustering for semantic grouping
-        if token_clusters is not None:
-            self.token_clusterer = nn.Sequential(
-                nn.Linear(dim, dim // 2),
-                nn.GELU(),
-                nn.Linear(dim // 2, token_clusters)
-            )
-        else:
-            self.token_clusterer = None
-            
-        # Layer norm for each hierarchy level
-        self.norms = nn.ModuleList([
-            nn.LayerNorm(dim)
-            for _ in range(num_hierarchies)
-        ])
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        """Initialize weights properly for stable training"""
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-            
-    def _create_token_clusters(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        """Group tokens into semantic clusters"""
-        b, n, d = x.shape
-        
-        # Get cluster assignments
-        logits = self.token_clusterer(x)  # b n c
-        cluster_weights = F.softmax(logits, dim=-1)
-        
-        # Determine hard assignments
-        cluster_indices = torch.argmax(cluster_weights, dim=-1)  # b n
-        
-        # Create cluster centroids
-        clusters = torch.zeros(b, self.token_clusters, d, device=x.device)
-        
-        # Use scatter_add to create weighted centroids
-        for i in range(self.token_clusters):
-            mask = (cluster_indices == i).float().unsqueeze(-1)  # b n 1
-            weighted_inputs = x * mask
-            clusters[:, i] = weighted_inputs.sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-            
-        return clusters, cluster_indices
-        
-    def forward(
-        self,
-        x: Tensor,
-        mask: Optional[Tensor] = None
-    ) -> Tensor:
-        """
-        Forward pass for hierarchical multi-scale attention
-        
-        Args:
-            x: Input tensor of shape (batch, seq_len, dim)
-            mask: Optional attention mask
-            
-        Returns:
-            Output tensor of shape (batch, seq_len, dim)
-        """
-        b, n, d = x.shape
-        
-        # Apply token clustering if enabled
-        if self.token_clusterer is not None:
-            clusters, cluster_indices = self._create_token_clusters(x)
-        
-        # Routing logits
-        routing_logits = self.router(x)  # b n (r h)
-        routing_logits = rearrange(
-            routing_logits, 
-            'b n (r h) -> b n r h', 
-            r=self.routes, 
-            h=self.num_hierarchies
-        )
-        
-        # Softmax over hierarchy dimension 
-        hierarchy_weights = F.softmax(routing_logits, dim=-1)  # b n r h
-        
-        # Initialize output containers
-        outputs = []
-        
-        # Process each hierarchy level
-        for i, (attn, norm) in enumerate(zip(self.attentions, self.norms)):
-            # Normalize input
-            norm_x = norm(x)
-            
-            # Apply attention at this hierarchy level
-            level_output = attn(norm_x, mask=mask)  # b n d
-            outputs.append(level_output)
-            
-        # Stack outputs from all hierarchy levels
-        stacked_outputs = torch.stack(outputs, dim=2)  # b n h d
-        
-        # Compute weighted combination based on routing
-        # First, combine route dimension for each hierarchy
-        route_combined_weights = hierarchy_weights.mean(dim=2)  # b n h
-        route_combined_weights = route_combined_weights.unsqueeze(-1)  # b n h 1
-        
-        # Apply weights to stacked outputs
-        weighted_output = (stacked_outputs * route_combined_weights).sum(dim=2)  # b n d
-        
-        # Final projection
-        output = self.route_combiner(weighted_output)
-        
-        return output
-
-##############################################
-# Retrieval-Augmented Memory Architecture    #
-##############################################
-
-class HashCodeGenerator(nn.Module):
-    """Generate efficient binary hash codes for memory retrieval"""
-    
-    def __init__(
-        self,
-        dim: int,
-        hash_bits: int = 128,
-        hash_function: str = 'neural'  # 'neural' or 'lsh'
-    ):
-        super().__init__()
-        self.dim = dim
-        self.hash_bits = hash_bits
-        self.hash_function = hash_function
-        
-        if hash_function == 'neural':
-            # Neural network for learning hash codes
-            self.hash_net = nn.Sequential(
-                nn.Linear(dim, dim // 2),
-                nn.LayerNorm(dim // 2),
-                nn.GELU(),
-                nn.Linear(dim // 2, hash_bits)
-            )
-        else:
-            # Random projection matrix for LSH
-            self.register_buffer(
-                'projection',
-                torch.randn(dim, hash_bits) / math.sqrt(dim)
-            )
-            
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Generate hash codes for input embeddings
-        
-        Args:
-            x: Input embeddings of shape (batch, dim)
-            
-        Returns:
-            Binary hash codes of shape (batch, hash_bits)
-        """
-        if self.hash_function == 'neural':
-            logits = self.hash_net(x)
-        else:
-            logits = torch.matmul(x, self.projection)
-            
-        # Binarize with straight-through estimator for gradient flow
-        binary_codes = (logits > 0).float()
-        codes = logits + (binary_codes - logits).detach()
-        
-        return codes
-        
-    def compute_hamming_distance(self, a: Tensor, b: Tensor) -> Tensor:
-        """Compute Hamming distance between sets of binary codes"""
-        xor = (a.unsqueeze(1) != b.unsqueeze(0)).float()
-        return xor.sum(dim=-1)
-
-class SemanticIndexer(nn.Module):
-    """Semantic indexer for efficient memory retrieval"""
-    
-    def __init__(
-        self,
-        dim: int,
-        index_dim: int = 256,
-        num_clusters: int = 16,
-        hash_bits: int = 128
-    ):
-        super().__init__()
-        self.dim = dim
-        self.index_dim = index_dim
-        self.num_clusters = num_clusters
-        
-        # Dimensionality reduction for indexing
-        self.encoder = nn.Sequential(
-            nn.Linear(dim, index_dim),
-            nn.LayerNorm(index_dim),
-            nn.GELU()
-        )
-        
-        # Hash code generator
-        self.hash_generator = HashCodeGenerator(index_dim, hash_bits)
-        
-        # Cluster centroids
-        self.register_buffer(
-            'centroids',
-            torch.zeros(num_clusters, index_dim)
-        )
-        self.register_buffer(
-            'cluster_usage',
-            torch.zeros(num_clusters)
-        )
-        
-        # Initialize centroids with random values
-        nn.init.normal_(self.centroids, std=0.02)
-        
-        # Cluster assignment counter
-        self.total_assignments = 0
-        
-    def encode(self, x: Tensor) -> Tensor:
-        """Encode input into index space"""
-        return self.encoder(x)
-        
-    def get_hash_codes(self, x: Tensor) -> Tensor:
-        """Get hash codes for input"""
-        encoded = self.encode(x)
-        return self.hash_generator(encoded)
-        
-    def assign_clusters(self, embeddings: Tensor) -> Tensor:
-        """Assign embeddings to nearest clusters"""
-        # Compute distances to all centroids
-        encoded = self.encode(embeddings)  # b n d
-        
-        # Calculate distances to centroids
-        distances = torch.cdist(encoded, self.centroids)  # b n c
-        
-        # Get cluster assignments
-        cluster_idx = torch.argmin(distances, dim=-1)  # b n
-        
-        return cluster_idx
-        
-    def update_centroids(self, embeddings: Tensor, assignments: Tensor) -> None:
-        """Update cluster centroids with new embeddings"""
-        if not self.training:
-            return
-            
-        encoded = self.encode(embeddings)
-        batch_size, seq_len, _ = encoded.shape
-        
-        # Update cluster usage counts
-        for c in range(self.num_clusters):
-            count = (assignments == c).sum().item()
-            self.cluster_usage[c] += count
-            
-        # Update centroids (simple average update)
-        for c in range(self.num_clusters):
-            mask = (assignments == c).float().unsqueeze(-1)  # b n 1
-            count = mask.sum()
-            
-            if count > 0:
-                weighted_sum = (encoded * mask).sum(dim=(0, 1))
-                self.centroids[c] = (
-                    self.centroids[c] * 0.9 + 
-                    weighted_sum * 0.1 / count
-                )
-                
-        self.total_assignments += batch_size * seq_len
-
-class RetrievalAugmentedMemory(nn.Module):
-    """
-    Retrieval-Augmented Memory component that integrates with 
-    vector databases and external knowledge stores
-    """
-    def __init__(
-        self,
-        dim: int,
-        memory_dim: int = 256,
-        num_retrievals: int = 16,
-        max_memory_size: int = 100000,
-        hash_bits: int = 128,
-        num_clusters: int = 16,
-        use_knn: bool = True,
-        retrieval_temp: float = 1.0,
-        adaptive_retrieval: bool = True
-    ):
-        super().__init__()
-        self.dim = dim
-        self.memory_dim = memory_dim
-        self.num_retrievals = num_retrievals
-        self.max_memory_size = max_memory_size
-        self.use_knn = use_knn
-        self.retrieval_temp = retrieval_temp
-        self.adaptive_retrieval = adaptive_retrieval
-        
-        # Memory storage
-        self.register_buffer(
-            'memory_keys',
-            torch.zeros(max_memory_size, memory_dim)
-        )
-        self.register_buffer(
-            'memory_values',
-            torch.zeros(max_memory_size, dim)
-        )
-        self.register_buffer(
-            'memory_usage',
-            torch.zeros(max_memory_size, dtype=torch.long)
-        )
-        self.register_buffer(
-            'memory_age',
-            torch.zeros(max_memory_size)
-        )
-        
-        # Current memory size
-        self.current_size = 0
-        
-        # Query/key projections
-        self.query_proj = nn.Linear(dim, memory_dim)
-        self.key_proj = nn.Linear(dim, memory_dim)
-        self.value_proj = nn.Linear(dim, dim)
-        
-        # Output projection and gate
-        self.output_proj = nn.Linear(dim * 2, dim)
-        self.output_gate = nn.Linear(dim * 2, 1)
-        
-        # Indexer for efficient retrieval
-        self.indexer = SemanticIndexer(
-            dim=dim,
-            index_dim=memory_dim,
-            num_clusters=num_clusters,
-            hash_bits=hash_bits
-        )
-        
-        # Retrieval frequency stats
-        self.retrieval_stats = defaultdict(int)
-        
-        # Internal stats
-        self.read_count = 0
-        self.write_count = 0
-        self.hit_rate = 0.0
-        self.last_access_time = time.time()
-        
-    def reset_memory(self):
-        """Reset memory contents"""
-        self.current_size = 0
-        self.memory_usage.zero_()
-        self.memory_age.zero_()
-        self.retrieval_stats.clear()
-        
-    def add_memories(self, keys: Tensor, values: Tensor) -> None:
-        """
-        Add new items to memory
-        
-        Args:
-            keys: Key embeddings of shape (batch, memory_dim)
-            values: Value embeddings of shape (batch, dim)
-        """
-        batch_size = keys.shape[0]
-        current_time = time.time()
-        
-        # If memory is full, replace least used items
-        if self.current_size + batch_size > self.max_memory_size:
-            # Find indices of least used memory slots
-            if self.current_size == self.max_memory_size:
-                # Score memories by usage and recency
-                scores = (
-                    self.memory_usage.float() / max(1, self.memory_usage.max()) * 0.8 +
-                    (1.0 / (current_time - self.memory_age.float() + 1.0)) * 0.2
-                )
-                _, indices = torch.topk(scores, k=batch_size, largest=False)
+            # Unknown algorithm
+            logger.warning(f"Unknown compression algorithm: {algorithm}")
+            if "data" in compressed_data:
+                return compressed_data["data"]
             else:
-                # Use unused slots first, then least used slots
-                unused = self.current_size
-                remaining = batch_size - (self.max_memory_size - unused)
+                # Try to return the first tensor found as a fallback
+                for k, v in compressed_data.items():
+                    if isinstance(v, torch.Tensor):
+                        return v
                 
-                if remaining > 0:
-                    # Need to replace some existing memories
-                    scores = (
-                        self.memory_usage[:unused].float() / 
-                        max(1, self.memory_usage[:unused].max()) * 0.8 +
-                        (1.0 / (current_time - self.memory_age[:unused].float() + 1.0)) * 0.2
-                    )
-                    _, replace_indices = torch.topk(scores, k=remaining, largest=False)
-                    indices = torch.cat([
-                        torch.arange(unused, self.max_memory_size, device=keys.device),
-                        replace_indices
-                    ])
-                else:
-                    # Just use unused slots
-                    indices = torch.arange(
-                        unused, 
-                        unused + batch_size, 
-                        device=keys.device
-                    )
-        else:
-            # Use next available slots
-            indices = torch.arange(
-                self.current_size, 
-                self.current_size + batch_size, 
-                device=keys.device
-            )
-            
-        # Store new memories
-        self.memory_keys[indices] = keys
-        self.memory_values[indices] = values
-        self.memory_usage[indices] = 0
-        self.memory_age[indices] = current_time
-        
-        # Update size if needed
-        self.current_size = min(self.max_memory_size, self.current_size + batch_size)
-        self.write_count += batch_size
-        
-    def retrieve(
-        self, 
-        queries: Tensor, 
-        num_retrievals: Optional[int] = None,
-        return_indices: bool = False
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """
-        Retrieve relevant memories based on queries
-        
-        Args:
-            queries: Query embeddings of shape (batch, seq_len, dim)
-            num_retrievals: Number of items to retrieve
-            return_indices: Whether to return retrieval indices
-            
-        Returns:
-            Retrieved memories of shape (batch, seq_len, num_retrievals, dim)
-        """
-        if self.current_size == 0:
-            # No memories available yet
-            batch, seq_len = queries.shape[:2]
-            dummy = torch.zeros(batch, seq_len, self.dim, device=queries.device)
-            return (dummy, torch.zeros(batch, seq_len, 0, device=queries.device)) if return_indices else dummy
-            
-        # Project queries
-        batch, seq_len = queries.shape[:2]
-        query_emb = self.query_proj(queries.view(-1, self.dim))  # (b*n, memory_dim)
-        
-        # Number of items to retrieve
-        k = num_retrievals or self.num_retrievals
-        k = min(k, self.current_size)
-        
-        # Efficient retrieval using indexer clusters
-        device = queries.device
-        active_memory = self.current_size
-        
-        if self.use_knn and self.indexer is not None:
-            # First, assign queries to clusters
-            flat_queries = queries.view(-1, self.dim)
-            cluster_assignments = self.indexer.assign_clusters(flat_queries)
-            
-            retrieved_values = []
-            retrieved_indices = []
-            
-            # For each query, retrieve from appropriate cluster
-            for i, query in enumerate(query_emb):
-                # Get cluster for this query
-                cluster = cluster_assignments[i].item()
-                
-                # Find memories in this cluster
-                cluster_mask = self.indexer.assign_clusters(
-                    self.memory_values[:active_memory]
-                ) == cluster
-                
-                if cluster_mask.sum() >= k:
-                    # Enough memories in this cluster
-                    cluster_keys = self.memory_keys[:active_memory][cluster_mask]
-                    
-                    # Compute similarity scores
-                    scores = torch.matmul(query.unsqueeze(0), cluster_keys.t())[0]
-                    scores = scores / self.retrieval_temp
-                    
-                    # Get top-k indices
-                    _, local_indices = torch.topk(scores, k=k)
-                    global_indices = torch.nonzero(cluster_mask)[local_indices]
-                    
-                    # Get values
-                    values = self.memory_values[:active_memory][global_indices]
-                else:
-                    # Not enough in cluster, fall back to full search
-                    scores = torch.matmul(
-                        query.unsqueeze(0), 
-                        self.memory_keys[:active_memory].t()
-                    )[0]
-                    scores = scores / self.retrieval_temp
-                    
-                    # Get top-k indices
-                    _, indices = torch.topk(scores, k=k)
-                    values = self.memory_values[:active_memory][indices]
-                    global_indices = indices
-                    
-                retrieved_values.append(values)
-                retrieved_indices.append(global_indices)
-                
-                # Update usage statistics
-                self.memory_usage[global_indices] += 1
-                
-            # Stack results
-            retrieved = torch.stack(retrieved_values)  # (b*n, k, dim)
-            indices = torch.stack(retrieved_indices)  # (b*n, k)
-            
-            # Reshape to match input dimensions
-            retrieved = retrieved.view(batch, seq_len, k, self.dim)
-            indices = indices.view(batch, seq_len, k)
-        else:
-            # Standard dot-product retrieval
-            scores = torch.matmul(
-                query_emb, 
-                self.memory_keys[:active_memory].t()
-            )  # (b*n, mem_size)
-            scores = scores / self.retrieval_temp
-            
-            # Get top-k indices and values
-            _, indices = torch.topk(scores, k=k, dim=-1)  # (b*n, k)
-            batch_indices = indices.view(-1)
-            
-            # Gather memory values
-            values = self.memory_values[:active_memory][batch_indices]
-            retrieved = values.view(batch * seq_len, k, self.dim)
-            retrieved = retrieved.view(batch, seq_len, k, self.dim)
-            
-            # Update usage statistics
-            unique_indices = torch.unique(indices)
-            self.memory_usage[unique_indices] += 1
-            
-        # Log retrieval stats
-        self.read_count += batch * seq_len
-            
-        return (retrieved, indices) if return_indices else retrieved
-        
-    def forward(
-        self,
-        x: Tensor,
-        store_memories: bool = True
-    ) -> Tensor:
-        """
-        Forward pass with memory retrieval and optional storage
-        
-        Args:
-            x: Input tensor of shape (batch, seq_len, dim)
-            store_memories: Whether to store new memories
-            
-        Returns:
-            Enhanced output of shape (batch, seq_len, dim)
-        """
-        batch, seq_len, _ = x.shape
-        
-        # Project keys and values for storage
-        keys = self.key_proj(x)  # (b, n, memory_dim)
-        values = self.value_proj(x)  # (b, n, dim)
-        
-        # Retrieve relevant memories
-        retrieved_memories = self.retrieve(x)  # (b, n, k, dim)
-        
-        # Compute attention weights over retrieved memories
-        query_for_attn = self.query_proj(x).unsqueeze(2)  # (b, n, 1, memory_dim)
-        retrieved_keys = self.key_proj(retrieved_memories)  # (b, n, k, memory_dim)
-        
-        # Compute attention scores
-        scores = torch.matmul(query_for_attn, retrieved_keys.transpose(-1, -2))  # (b, n, 1, k)
-        scores = scores.squeeze(2) / math.sqrt(self.memory_dim)  # (b, n, k)
-        
-        # Apply softmax to get attention weights
-        attn_weights = F.softmax(scores, dim=-1)  # (b, n, k)
-        attn_weights = attn_weights.unsqueeze(-1)  # (b, n, k, 1)
-        
-        # Apply attention to retrieved memories
-        attended_memories = (retrieved_memories * attn_weights).sum(dim=2)  # (b, n, dim)
-        
-        # Combine with original input
-        combined = torch.cat([x, attended_memories], dim=-1)  # (b, n, dim*2)
-        
-        # Generate gate values to control retrieval influence
-        gate = torch.sigmoid(self.output_gate(combined))  # (b, n, 1)
-        
-        # Apply gate and project to output dimension
-        output = x + gate * self.output_proj(combined)
-        
-        # Optionally store current memories
-        if store_memories and self.training:
-            # Sample a subset of items to store (to avoid saving everything)
-            sample_rate = min(64, max(1, seq_len // 8)) / seq_len
-            mask = torch.rand(batch, seq_len, device=x.device) < sample_rate
-            
-            if mask.sum() > 0:
-                sampled_keys = keys[mask]
-                sampled_values = values[mask]
-                self.add_memories(sampled_keys, sampled_values)
-                
-        return output
+                # Last resort fallback
+                logger.error("Failed to decompress token with unknown algorithm")
+                return torch.zeros(metadata.get("original_shape", (1, self.model_dim)), 
+                                  device=self.device)
 
-##############################################
-# Hardware-aware adaptive computation        #
-##############################################
-
-class HardwareProfile(NamedTuple):
-    """Hardware profile information for adaptive computation"""
-    device_type: str = 'cuda'  # 'cuda', 'cpu', 'tpu', etc.
-    compute_capability: Tuple[int, int] = (8, 0)  # CUDA compute capability if applicable
-    memory_bandwidth_gbps: float = 0.0
-    max_memory_gb: float = 0.0
-    flops_per_second: float = 0.0
-    energy_efficiency: float = 1.0  # Lower is more efficient
-    supports_quantization: bool = True
-    supports_sparse: bool = True
-    tensor_cores: bool = True
-
-class HardwareAwareAdapter(nn.Module):
+class UltraScaleMemoryManager:
     """
-    Hardware-aware adaptation layer that optimizes computation
-    based on the underlying hardware capabilities
+    Ultra-scale memory manager optimized for 100M+ token context windows with
+    neural-symbolic hybrid approach, extreme efficiency, and intelligent memory policies
     """
-    def __init__(
-        self,
-        dim: int,
-        profile: Optional[HardwareProfile] = None,
-        auto_profile: bool = True,
-        target_latency_ms: float = 10.0,
-        target_memory_gb: float = 0.0,
-        target_energy: float = 1.0,
-        optimization_level: int = 2  # 0=none, 1=light, 2=medium, 3=aggressive
-    ):
-        super().__init__()
-        self.dim = dim
-        self.profile = profile
-        self.auto_profile = auto_profile
-        self.target_latency_ms = target_latency_ms
-        self.target_memory_gb = target_memory_gb
-        self.target_energy = target_energy
-        self.optimization_level = optimization_level
-        
-        # Automatically determine hardware profile if needed
-        if auto_profile and profile is None:
-            self.profile = self._detect_hardware()
-            
-        # Adaptation parameters
-        self.register_buffer('memory_headroom', torch.tensor(1.0))
-        self.register_buffer('compute_headroom', torch.tensor(1.0))
-        self.register_buffer('energy_headroom', torch.tensor(1.0))
-        
-        # Performance tracking
-        self.perf_history = []
-        self.last_adaptation_time = time.time()
-        
-        # Adaptation state
-        self.current_precision = 32  # bits
-        self.current_sparsity = 0.0
-        self.current_width_mult = 1.0
-        self.current_depth_mult = 1.0
-        
-        # Log hardware profile
-        if self.profile:
-            logger.info(f"Hardware profile: {self.profile}")
-            
-    def _detect_hardware(self) -> HardwareProfile:
-        """Auto-detect hardware capabilities"""
-        device_type = 'cpu'
-        compute_capability = (0, 0)
-        memory_bandwidth_gbps = 0.0
-        max_memory_gb = 0.0
-        flops_per_second = 0.0
-        energy_efficiency = 1.0
-        supports_quantization = False
-        supports_sparse = False
-        tensor_cores = False
-        
-        # Check if CUDA is available
-        if torch.cuda.is_available():
-            device_type = 'cuda'
-            device = torch.cuda.current_device()
-            
-            # Get device properties
-            props = torch.cuda.get_device_properties(device)
-            compute_capability = (props.major, props.minor)
-            memory_bandwidth_gbps = props.memory_clock_rate * props.memory_bus_width * 2 / 8 / 1e6
-            max_memory_gb = props.total_memory / 1e9
-            
-            # Estimate FLOPS based on CUDA cores and clock speed
-            cuda_cores = props.multi_processor_count * (
-                128 if props.major >= 7 else 
-                64 if props.major >= 6 else 
-                32
-            )
-            clock_ghz = props.clock_rate / 1e6
-            flops_per_second = cuda_cores * clock_ghz * 2 * 1e9  # FMA = 2 ops
-            
-            # Check for Tensor Cores
-            tensor_cores = (props.major >= 7)
-            
-            # Modern GPUs support these features
-            supports_quantization = True
-            supports_sparse = True
-            
-            # Energy efficiency heuristic based on architecture
-            if props.major >= 8:  # Ampere or newer
-                energy_efficiency = 0.7
-            elif props.major >= 7:  # Volta/Turing
-                energy_efficiency = 0.85
-            else:
-                energy_efficiency = 1.0
-                
-        return HardwareProfile(
-            device_type=device_type,
-            compute_capability=compute_capability,
-            memory_bandwidth_gbps=memory_bandwidth_gbps,
-            max_memory_gb=max_memory_gb,
-            flops_per_second=flops_per_second,
-            energy_efficiency=energy_efficiency,
-            supports_quantization=supports_quantization,
-            supports_sparse=supports_sparse,
-            tensor_cores=tensor_cores
-        )
-        
-    def update_performance_metrics(
-        self,
-        latency_ms: float,
-        memory_used_gb: float,
-        energy_used: float = 1.0
-    ) -> None:
-        """Update performance metrics for adaptation"""
-        self.perf_history.append({
-            'time': time.time(),
-            'latency_ms': latency_ms,
-            'memory_used_gb': memory_used_gb,
-            'energy_used': energy_used,
-            'precision': self.current_precision,
-            'sparsity': self.current_sparsity,
-            'width_mult': self.current_width_mult,
-            'depth_mult': self.current_depth_mult
-        })
-        
-        # Keep history size reasonable
-        if len(self.perf_history) > 100:
-            self.perf_history = self.perf_history[-100:]
-            
-        # Update headroom metrics
-        if self.target_latency_ms > 0:
-            self.compute_headroom.fill_(self.target_latency_ms / max(0.1, latency_ms))
-            
-        if self.target_memory_gb > 0:
-            self.memory_headroom.fill_(self.target_memory_gb / max(0.1, memory_used_gb))
-            
-        if self.target_energy > 0:
-            self.energy_headroom.fill_(self.target_energy / max(0.1, energy_used))
-            
-    def adapt(self) -> Dict[str, Any]:
-        """
-        Adapt computation based on performance metrics and hardware profile
-        
-        Returns:
-            Dictionary of adaptation parameters
-        """
-        if self.optimization_level == 0 or not self.profile:
-            return {
-                'precision': 32,
-                'sparsity': 0.0,
-                'width_mult': 1.0,
-                'depth_mult': 1.0
-            }
-            
-        # Check if we need to adapt
-        current_time = time.time()
-        if current_time - self.last_adaptation_time < 10.0:  # Only adapt every 10 seconds
-            return {
-                'precision': self.current_precision,
-                'sparsity': self.current_sparsity,
-                'width_mult': self.current_width_mult,
-                'depth_mult': self.current_depth_mult
-            }
-            
-        self.last_adaptation_time = current_time
-            
-        # Extract headroom values
-        compute = self.compute_headroom.item()
-        memory = self.memory_headroom.item()
-        energy = self.energy_headroom.item()
-        
-        # Determine adaptation based on headroom and optimization level
-        precision = 32
-        sparsity = 0.0
-        width_mult = 1.0
-        depth_mult = 1.0
-        
-        # Memory-constrained adaptation
-        if memory < 0.8:  # Low memory headroom
-            # Reduce precision based on severity
-            if self.profile.supports_quantization:
-                if memory < 0.3 and self.optimization_level >= 3:
-                    precision = 4
-                elif memory < 0.5 and self.optimization_level >= 2:
-                    precision = 8
-                elif memory < 0.8 and self.optimization_level >= 1:
-                    precision = 16
-                    
-            # Increase sparsity based on severity
-            if self.profile.supports_sparse:
-                if memory < 0.3 and self.optimization_level >= 3:
-                    sparsity = 0.7
-                elif memory < 0.5 and self.optimization_level >= 2:
-                    sparsity = 0.5
-                elif memory < 0.8 and self.optimization_level >= 1:
-                    sparsity = 0.3
-                    
-        # Compute-constrained adaptation
-        if compute < 0.8:  # Low compute headroom
-            # Adjust width/depth multiples
-            if compute < 0.3 and self.optimization_level >= 3:
-                width_mult = 0.5
-                depth_mult = 0.5
-            elif compute < 0.5 and self.optimization_level >= 2:
-                width_mult = 0.7
-                depth_mult = 0.7
-            elif compute < 0.8 and self.optimization_level >= 1:
-                width_mult = 0.85
-                depth_mult = 0.85
-                
-        # Energy-constrained adaptation
-        if energy < 0.8 and self.optimization_level >= 2:  # Low energy headroom
-            # Prioritize energy efficiency
-            precision = min(precision, 16)  # Lower precision
-            sparsity = max(sparsity, 0.3)   # Increase sparsity
-            
-        # Update current state
-        self.current_precision = precision
-        self.current_sparsity = sparsity
-        self.current_width_mult = width_mult
-        self.current_depth_mult = depth_mult
-        
-        return {
-            'precision': precision,
-            'sparsity': sparsity,
-            'width_mult': width_mult,
-            'depth_mult': depth_mult
-        }
-        
-    def forward(self, x: Tensor) -> Tuple[Tensor, Dict[str, Any]]:
-        """Forward pass with adaptation"""
-        # Get adaptation parameters
-        params = self.adapt()
-        
-        # Apply adaptation (in real implementation, this would be more complex)
-        # Here we're just returning the input and adaptation parameters
-        
-        return x, params
-
-##############################################
-# Main Advanced Enterprise Neural Memory     #
-##############################################
-
-class AdvancedEnterpriseNeuralMemory(nn.Module):
-    """
-    Advanced Enterprise Neural Memory: Ultra-scalable memory architecture
-    with massive context windows, multi-tier storage, and adaptive computation
     
-    Core features:
-    - Multi-tier memory hierarchy (hot/warm/cold storage)
-    - Extreme context window expansion (100K+ tokens)
-    - Ultra-sparse attention mechanisms
-    - Retrieval-augmented memory integration
-    - Memory lifecycle management
-    - Advanced quantization with mixed precision
-    - Semantic clustering for improved retention
-    - Distributed hierarchical memory sharding
-    - Predictive memory prefetching
-    - Self-optimizing memory pathways
-    - Hardware-aware adaptive computation
-    """
     def __init__(
         self,
-        dim: int,
-        heads: int = 8,
-        dim_head: Optional[int] = None,
-        max_seq_len: int = 102400,  # Default to 100K context
-        chunk_size: int = 64,
-        num_memory_tiers: int = 3,  # Hot, Warm, Cold tiers
-        enable_retrieval_augmentation: bool = True,
-        retrieval_size: int = 16,
-        external_memory_size: int = 100000,
-        enable_quantization: bool = True,
-        quantization_bits: int = 8,
-        enable_clustering: bool = True,
-        num_clusters: int = 16,
-        enable_distributed: bool = False,
-        num_memory_shards: int = 4,
-        enable_prefetching: bool = True,
-        hardware_aware: bool = True,
-        energy_efficiency_level: int = 2,  # 0=off, 1=light, 2=medium, 3=aggressive
-        enable_telemetry: bool = True,
-        model: Optional[Module] = None,
-        default_model_kwargs: dict = dict(
-            depth=2,
-            expansion_factor=4.0
-        ),
-        memory_lifecycle_policy: Optional[MemoryLifecyclePolicy] = None,
-        checkpoint_interval: int = 1000,
-        recovery_enabled: bool = True
-    ):
-        super().__init__()
+        model_dim: int,
+        # Memory capacity parameters
+        max_focus_tokens: int = 128,             # Tiny working memory
+        max_active_tokens: int = 1024,           # Current context window
+        max_foreground_tokens: int = 8192,       # Recent important context
+        max_background_tokens: int = 32768,      # Supporting context
+        max_episodic_tokens: int = 131072,       # Episodic memory capacity
+        max_semantic_tokens: int = 65536,        # Semantic memory capacity
+        max_general_tokens: int = 524288,        # General memory capacity
+        max_categorical_tokens: int = 1048576,   # Categorical memory capacity
+        max_archival_tokens: int = 4194304,      # Archival memory capacity 
+        max_reference_tokens: int = 2097152,     # Reference memory capacity
+        max_consolidated_tokens: int = 1048576,  # Consolidated memory capacity
+        max_memory_resident_tokens: int = 8388608,  # Maximum tokens in GPU/CPU
+        max_total_tokens: int = 100 * 1000 * 1000,  # 100M tokens total capacity
         
-        # Initialize base configuration
-        self.dim = dim
-        dim_head = dim_head or (dim // heads)
-        self.dim_head = dim_head
-        self.heads = heads
-        self.max_seq_len = max_seq_len
-        self.chunk_size = chunk_size
-        self.num_memory_tiers = num_memory_tiers
-        self.enable_retrieval_augmentation = enable_retrieval_augmentation
-        self.retrieval_size = retrieval_size
-        self.enable_quantization = enable_quantization
-        self.quantization_bits = quantization_bits
-        self.enable_clustering = enable_clustering 
-        self.num_clusters = num_clusters
-        self.enable_distributed = enable_distributed
-        self.num_memory_shards = num_memory_shards
-        self.enable_prefetching = enable_prefetching
-        self.hardware_aware = hardware_aware
-        self.energy_efficiency_level = energy_efficiency_level
-        self.enable_telemetry = enable_telemetry
+        # Memory management parameters
+        offload_path: str = "./ultra_memory_offload",
+        enable_tensor_compression: bool = True,
+        enable_semantic_compression: bool = True,
+        compression_schedules: bool = True,
+        token_pruning: bool = True,
+        token_deduplication: bool = True,
+        pruning_threshold: float = 0.1,         # Threshold for pruning unimportant tokens
+        min_pruning_distance: int = 16384,      # Don't prune tokens closer than this
+        enable_checkpointing: bool = True,
+        checkpoint_interval: int = 100000,
+        
+        # Indexing and retrieval
+        enable_vector_index: bool = True,        # Enable semantic vector indexing
+        vector_index_sample_rate: float = 0.1,   # Percentage of tokens to index
+        vector_dim: int = 64,                    # Dimension for retrieval vectors
+        
+        # Hardware management
+        device: Optional[torch.device] = None,
+        offload_device: Optional[torch.device] = None,
+        enable_mixed_precision: bool = True,
+        precision_bits: int = 16,
+        
+        # Advanced memory policies
+        memory_consolidation_interval: int = 1000000,  # Token interval for consolidation
+        semantic_extraction_threshold: float = 0.7,    # Importance threshold for semantic extraction
+        cognitive_context_size: int = 4096,            # Size of active cognitive context
+        
+        # Task-oriented memory
+        enable_task_memory: bool = True,              # Enable specialized task memory
+        task_memory_size: int = 16384,                # Number of task-specific tokens
+        
+        # Auto-scaling
+        auto_scaling: bool = True,                    # Auto-scale memory tiers
+        min_free_space_ratio: float = 0.1             # Min free space to maintain
+    ):
+        # Store core parameters
+        self.model_dim = model_dim
+        
+        # Memory capacity parameters
+        self.max_focus_tokens = max_focus_tokens
+        self.max_active_tokens = max_active_tokens
+        self.max_foreground_tokens = max_foreground_tokens
+        self.max_background_tokens = max_background_tokens
+        self.max_episodic_tokens = max_episodic_tokens
+        self.max_semantic_tokens = max_semantic_tokens
+        self.max_general_tokens = max_general_tokens
+        self.max_categorical_tokens = max_categorical_tokens
+        self.max_archival_tokens = max_archival_tokens
+        self.max_reference_tokens = max_reference_tokens
+        self.max_consolidated_tokens = max_consolidated_tokens
+        self.max_memory_resident_tokens = max_memory_resident_tokens
+        self.max_total_tokens = max_total_tokens
+        
+        # Memory management parameters
+        self.offload_path = offload_path
+        self.enable_tensor_compression = enable_tensor_compression
+        self.enable_semantic_compression = enable_semantic_compression
+        self.compression_schedules = compression_schedules
+        self.token_pruning = token_pruning
+        self.token_deduplication = token_deduplication
+        self.pruning_threshold = pruning_threshold
+        self.min_pruning_distance = min_pruning_distance
+        self.enable_checkpointing = enable_checkpointing
         self.checkpoint_interval = checkpoint_interval
-        self.recovery_enabled = recovery_enabled
         
-        # Inner dimensions
-        inner_dim = dim_head * heads
+        # Hardware management
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.offload_device = offload_device or torch.device('cpu')
+        self.enable_mixed_precision = enable_mixed_precision
+        self.precision_bits = precision_bits
         
-        # Initialize metrics
-        self.metrics = MemoryMetrics() if enable_telemetry else None
+        # Vector indexing parameters
+        self.enable_vector_index = enable_vector_index
+        self.vector_index_sample_rate = vector_index_sample_rate
+        self.vector_dim = vector_dim
         
-        # Initialize memory lifecycle manager
-        if memory_lifecycle_policy is None:
-            memory_lifecycle_policy = MemoryLifecyclePolicy(
-                auto_optimize=True
-            )
-        self.lifecycle_policy = memory_lifecycle_policy
+        # Advanced memory policies
+        self.memory_consolidation_interval = memory_consolidation_interval
+        self.semantic_extraction_threshold = semantic_extraction_threshold
+        self.cognitive_context_size = cognitive_context_size
         
-        # Initialize memory manager
-        self.memory_manager = MemoryManager(
-            policy=memory_lifecycle_policy,
-            max_hot_segments=1000,
-            max_total_segments=10000,
-            enable_offloading=True,
-            enable_telemetry=enable_telemetry,
-            semantic_indexing=enable_clustering
-        )
+        # Task-oriented memory
+        self.enable_task_memory = enable_task_memory
+        self.task_memory_size = task_memory_size
+        
+        # Auto-scaling settings
+        self.auto_scaling = auto_scaling
+        self.min_free_space_ratio = min_free_space_ratio
         
         # Initialize compression engine
-        self.compression_engine = AdaptiveCompressionEngine(
-            default_algorithm='svd',
-            default_ratio=0.5,
-            auto_select=True,
-            enable_mixed_algorithms=True
+        self.compression_engine = NeuroSymbolicCompression(
+            model_dim=model_dim,
+            base_ratio=0.5,
+            distance_factor=0.3,
+            max_ratio=0.001,  # 0.1% of original size for distant tokens
+            enable_mixed_precision=enable_mixed_precision,
+            enable_semantic_compression=enable_semantic_compression,
+            semantic_dim=vector_dim,
+            precision_schedule=[32, 16, 8, 4, 2, 1],
+            device=self.device
         )
         
-        # Hardware-aware adapter
-        if hardware_aware:
-            self.hardware_adapter = HardwareAwareAdapter(
-                dim=dim,
-                auto_profile=True,
-                optimization_level=energy_efficiency_level
-            )
+        # Initialize memory storage for each tier using OrderedDict for consistent iteration
+        self.memory_tiers = {tier: OrderedDict() for tier in NeuralMemoryTier}
+        
+        # Token metadata storage
+        self.token_metadata = {}  # token_id -> TokenMetadata
+        
+        # Create semantic vector index if enabled
+        if enable_vector_index:
+            self.init_vector_index()
         else:
-            self.hardware_adapter = None
+            self.vector_index = None
             
-        # Initialize memory model
-        if model is None:
-            if enable_quantization:
-                model = HierarchicalMemoryMLP(
-                    dim=dim_head,
-                    expansion_factor=default_model_kwargs.get('expansion_factor', 4.0),
-                    depth=default_model_kwargs.get('depth', 2),
-                    num_experts=num_clusters,
-                    sparsity=0.9,
-                    enable_quantization=True
-                )
-            else:
-                model = MemoryMLP(dim_head, **default_model_kwargs)
+        # Create task memory if enabled
+        if enable_task_memory:
+            self.task_memory = {}
+            self.task_memory_index = None
+            self.current_task_id = None
+        else:
+            self.task_memory = None
+            
+        # Position tracking
+        self.current_position = 0
+        self.last_checkpoint_position = 0
+        
+        # Current sequence tracking
+        self.current_sequence_id = str(uuid.uuid4())
+        self.sequence_boundaries = {}  # sequence_id -> (start_pos, end_pos)
+        
+        # Memory usage tracking
+        self.total_memory_usage = 0
+        self.memory_usage_by_tier = {tier: 0 for tier in NeuralMemoryTier}
+        
+        # Token access pattern tracking
+        self.recent_access_patterns = deque(maxlen=1000)
+        
+        # Content hash to token mapping for deduplication
+        self.content_hash_map = {}  # hash -> token_id
+        
+        # Create offload directory if needed
+        if not os.path.exists(offload_path):
+            os.makedirs(offload_path, exist_ok=True)
+            
+        # Performance counters
+        self.stats = {
+            "token_additions": 0,
+            "token_retrievals": 0,
+            "token_promotions": 0,
+            "token_offloads": 0,
+            "token_loads": 0,
+            "token_consolidations": 0,
+            "token_prunings": 0,
+            "token_deduplications": 0,
+            "memory_maintenance_runs": 0
+        }
+        
+        logger.info(f"Initialized UltraScaleMemoryManager for 100M+ context")
+        
+    def init_vector_index(self):
+        """Initialize vector index for semantic search"""
+        self.vector_index = None
+        
+        # Try to use FAISS for vector indexing if available
+        if HAS_FAISS:
+            try:
+                # Create a flat L2 index for fast cosine similarity
+                self.vector_index = faiss.IndexFlatIP(self.vector_dim)  # Inner product for normalized vectors
                 
-        self.memory_model = model
-        
-        # Initialize hierarchical attention 
-        self.hierarchical_attention = HierarchicalMultiScaleAttention(
-            dim=dim,
-            heads=heads,
-            dim_head=dim_head,
-            num_hierarchies=3,
-            base_window_size=chunk_size * 8,
-            window_multiplier=4,
-            causal=True,
-            dropout=0.1,
-            quantize=enable_quantization,
-            token_clusters=num_clusters if enable_clustering else None
-        )
-        
-        # Initialize retrieval-augmented memory
-        if enable_retrieval_augmentation:
-            self.retrieval_memory = RetrievalAugmentedMemory(
-                dim=dim,
-                memory_dim=dim_head,
-                num_retrievals=retrieval_size,
-                max_memory_size=external_memory_size,
-                hash_bits=128,
-                num_clusters=num_clusters,
-                use_knn=True
-            )
+                # Move to GPU if available
+                if self.device.type == 'cuda' and hasattr(faiss, 'StandardGpuResources'):
+                    res = faiss.StandardGpuResources()
+                    self.vector_index = faiss.index_cpu_to_gpu(res, 0, self.vector_index)
+                    
+                # Index to token mapping
+                self.vector_index_to_token = []
+                
+                logger.info("FAISS vector index initialized for semantic retrieval")
+            except Exception as e:
+                logger.warning(f"Failed to initialize FAISS index: {e}, falling back to basic retrieval")
+                self.vector_index = None
         else:
-            self.retrieval_memory = None
-            
-        # Initialize advanced projections
-        linear_class = UltraQuantizedLinear if enable_quantization else nn.Linear
-        
-        self.to_q = linear_class(dim, inner_dim, bias=False)
-        self.to_k = linear_class(dim, inner_dim, bias=False)
-        self.to_v = linear_class(dim, inner_dim, bias=False)
-        self.to_out = linear_class(inner_dim, dim, bias=False)
-        
-        # Initialize normalization
-        self.norm_input = nn.LayerNorm(dim)
-        self.norm_memory = nn.LayerNorm(dim)
-        self.norm_output = nn.LayerNorm(dim)
-        
-        # Initialize memory states tracking
-        self.memory_states = {}
-        self.current_memory_id = 0
-        self.step_counter = 0
-        
-        # Distributed memory shards if enabled
-        if enable_distributed and num_memory_shards > 1:
-            self.memory_shards = DistributedMemoryShards(
-                dim=dim,
-                num_shards=num_memory_shards,
-                redundancy=2
-            )
-        else:
-            self.memory_shards = None
-            
-        # For predictive prefetching
-        if enable_prefetching:
-            self.prefetch_predictor = nn.Linear(dim, 128)
-            
-        # Register zero buffer for reference
-        self.register_buffer('zero', torch.tensor(0.), persistent=False)
-        
-        # Gradient scaler for mixed precision
-        self.grad_scaler = GradScaler() if enable_quantization else None
-        
-        logger.info(f"Initialized AdvancedEnterpriseNeuralMemory with dim={dim}, "
-                   f"heads={heads}, max_seq_len={max_seq_len}")
-                   
-    def create_memory_segment(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None
-    ) -> str:
+            logger.info("FAISS not available, using basic vector retrieval instead")
+    
+    def add_tokens(
+        self, 
+        token_embeddings: Tensor,
+        token_ids: Optional[List[int]] = None,
+        token_types: Optional[List[int]] = None,
+        importance_scores: Optional[Tensor] = None,
+        sequence_id: Optional[str] = None,
+        cognitive_signals: Optional[Dict[NeuralCognitiveSignals, Tensor]] = None,
+        task_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> List[int]:
         """
-        Create a new memory segment from hidden states
+        Add token embeddings to memory with rich metadata
         
         Args:
-            hidden_states: Tensor of shape (batch, seq_len, dim)
-            attention_mask: Optional mask of shape (batch, seq_len)
+            token_embeddings: Tensor of token embeddings (seq_len, dim)
+            token_ids: Optional list of token IDs (will be generated if None)
+            token_types: Optional list of token types
+            importance_scores: Optional importance scores
+            sequence_id: Optional sequence identifier for grouped tokens
+            cognitive_signals: Optional dict of cognitive signals for each token
+            task_id: Optional task identifier for specialized memory
+            metadata: Optional additional metadata for the tokens
             
         Returns:
-            Memory segment ID
+            List of token IDs that were added
         """
-        # Generate a unique ID for this memory segment
-        memory_id = f"mem_{self.current_memory_id}"
-        self.current_memory_id += 1
+        seq_len = token_embeddings.shape[0]
         
-        batch_size, seq_len, _ = hidden_states.shape
+        # Move to device if needed
+        if token_embeddings.device != self.device:
+            token_embeddings = token_embeddings.to(self.device)
         
-        # Apply attention mask if provided
-        if attention_mask is not None:
-            # Expand mask to match hidden states
-            mask_expanded = attention_mask.unsqueeze(-1).expand_as(hidden_states)
-            hidden_states = hidden_states * mask_expanded
+        # Generate token IDs if not provided
+        if token_ids is None:
+            token_ids = list(range(self.current_position, self.current_position + seq_len))
             
-        # Generate semantic embedding for the segment
-        if self.enable_clustering:
-            # Use mean pooling for simplicity, but could be more sophisticated
-            semantic_emb = hidden_states.mean(dim=1)  # (batch, dim)
+        # Use default importance if not provided
+        if importance_scores is None:
+            importance_scores = torch.ones(seq_len, device=self.device) * 0.5
+            
+        # Use default token types if not provided
+        if token_types is None:
+            token_types = [0] * seq_len
+            
+        # Use current sequence ID if not provided
+        if sequence_id is None:
+            sequence_id = self.current_sequence_id
+            
+        # Update sequence boundaries
+        if sequence_id not in self.sequence_boundaries:
+            self.sequence_boundaries[sequence_id] = (self.current_position, self.current_position + seq_len)
         else:
-            semantic_emb = None
+            start, _ = self.sequence_boundaries[sequence_id]
+            self.sequence_boundaries[sequence_id] = (start, self.current_position + seq_len)
             
-        # Create memory segments (one per batch item)
-        for i in range(batch_size):
-            batch_id = f"{memory_id}_b{i}"
+        # Process cognitive signals if provided
+        if cognitive_signals is None:
+            cognitive_signals = {}
             
-            # Extract data for this batch item
-            data = {
-                "hidden_states": hidden_states[i],
-                "attention_mask": attention_mask[i] if attention_mask is not None else None
-            }
+        # Convert cognitive signals to per-token dict
+        token_cognitive_signals = []
+        for i in range(seq_len):
+            signals_dict = {}
+            for signal, values in cognitive_signals.items():
+                if isinstance(values, torch.Tensor) and values.shape[0] == seq_len:
+                    signals_dict[signal] = values[i].item()
+                else:
+                    # Use default value
+                    signals_dict[signal] = 0.5
+            token_cognitive_signals.append(signals_dict)
             
-            # Create metadata
-            metadata = {
-                "creation_time": time.time(),
-                "seq_len": seq_len,
-                "importance": 0.5  # Default importance
-            }
+        # Update task reference
+        if task_id is not None:
+            self.current_task_id = task_id
             
-            # Create segment
-            segment = MemorySegment(
-                memory_id=batch_id,
-                data=data,
-                metadata=metadata,
-                tier=MemoryTier.HOT,
-                semantic_embedding=semantic_emb[i] if semantic_emb is not None else None
+        # Store tokens in active tier
+        added_token_ids = []
+        for i in range(seq_len):
+            token_id = token_ids[i]
+            embed = token_embeddings[i:i+1]  # Keep dimension
+            importance = importance_scores[i].item()
+            
+            # Check for deduplication if enabled
+            if self.token_deduplication:
+                content_hash = hashlib.md5(embed.cpu().numpy().tobytes()).hexdigest()
+                
+                if content_hash in self.content_hash_map:
+                    existing_token_id = self.content_hash_map[content_hash]
+                    if existing_token_id in self.token_metadata:
+                        # Increment the reference counter for the existing token
+                        self.token_metadata[existing_token_id].importance = max(
+                            self.token_metadata[existing_token_id].importance,
+                            importance
+                        )
+                        
+                        # Update access time
+                        self.token_metadata[existing_token_id].update_access(time.time())
+                        
+                        # Skip adding this duplicate token
+                        self.stats["token_deduplications"] += 1
+                        continue
+                else:
+                    # Add hash to map
+                    self.content_hash_map[content_hash] = token_id
+            
+            # Create token metadata
+            token_meta = TokenMetadata(
+                token_id=token_id,
+                position=self.current_position + i,
+                creation_time=time.time(),
+                sequence_id=sequence_id,
+                tier=NeuralMemoryTier.ACTIVE,
+                importance=importance,
+                last_access_time=time.time(),
+                token_type=token_types[i],
+                compression_ratio=1.0,
+                precision_bits=self.precision_bits if self.enable_mixed_precision else 32,
+                cognitive_signals=token_cognitive_signals[i],
+                compressed=False
             )
             
-            # Add to memory manager
-            self.memory_manager.add_memory_segment(segment)
+            # Add any custom metadata
+            if metadata:
+                for k, v in metadata.items():
+                    if hasattr(token_meta, k):
+                        setattr(token_meta, k, v[i] if isinstance(v, (list, tuple)) and i < len(v) else v)
             
-        return memory_id
+            # Store metadata
+            self.token_metadata[token_id] = token_meta
+            
+            # Store embedding in active tier
+            self.memory_tiers[NeuralMemoryTier.ACTIVE][token_id] = {
+                "embedding": embed,
+                "compressed": False
+            }
+            
+            # Update memory usage
+            self.total_memory_usage += embed.nelement() * embed.element_size()
+            self.memory_usage_by_tier[NeuralMemoryTier.ACTIVE] += embed.nelement() * embed.element_size()
+            
+            # Add to vector index if enabled and selected for indexing
+            if self.enable_vector_index and self.vector_index is not None:
+                if random.random() < self.vector_index_sample_rate:
+                    if self.compression_engine.semantic_encoder is not None:
+                        # Use semantic encoder to get retrieval vector
+                        with torch.no_grad():
+                            semantic_vector = self.compression_engine.semantic_encoder(embed).cpu().numpy()
+                            # Normalize for cosine similarity
+                            norm = np.linalg.norm(semantic_vector)
+                            if norm > 0:
+                                semantic_vector = semantic_vector / norm
+                                
+                        # Store the semantic vector
+                        token_meta.semantic_vector = torch.from_numpy(semantic_vector).to(self.device)
+                        
+                        # Add to index
+                        try:
+                            self.vector_index.add(semantic_vector.reshape(1, -1))
+                            self.vector_index_to_token.append(token_id)
+                        except Exception as e:
+                            logger.warning(f"Failed to add to vector index: {e}")
+            
+            # Add to task memory if enabled
+            if self.enable_task_memory and task_id is not None:
+                if task_id not in self.task_memory:
+                    self.task_memory[task_id] = set()
+                self.task_memory[task_id].add(token_id)
+            
+            # Add to final list of added tokens
+            added_token_ids.append(token_id)
+            self.stats["token_additions"] += 1
+            
+        # Update current position
+        self.current_position += seq_len
         
-    def retrieve_memory_segment(self, memory_id: str) -> Optional[Dict[str, Tensor]]:
+        # Run memory maintenance
+        self._maintain_memory_tiers()
+        
+        # Checkpoint if needed
+        if self.enable_checkpointing and (self.current_position - self.last_checkpoint_position >= self.checkpoint_interval):
+            self._create_checkpoint()
+            self.last_checkpoint_position = self.current_position
+            
+        return added_token_ids
+        
+    def retrieve_tokens(
+        self, 
+        token_positions: List[int],
+        return_compressed: bool = False,
+        return_metadata: bool = True
+    ) -> Union[Tensor, Tuple[Tensor, List[TokenMetadata]]]:
         """
-        Retrieve a memory segment by ID
+        Retrieve token embeddings by position
         
         Args:
-            memory_id: Memory segment ID
+            token_positions: List of token positions to retrieve
+            return_compressed: Whether to return compressed representations
+            return_metadata: Whether to return token metadata
             
         Returns:
-            Dictionary of memory data, or None if not found
+            If return_metadata is True: Tuple of (embeddings, metadata)
+            Otherwise: Just embeddings tensor
         """
-        segment = self.memory_manager.get_memory_segment(memory_id)
-        if segment is None:
-            return None
-            
-        return segment.data
+        embeddings = []
+        metadata_list = []
         
-    def find_similar_memories(
-        self,
+        for pos in token_positions:
+            # Find token ID for this position
+            token_id = None
+            for tid, meta in self.token_metadata.items():
+                if meta.position == pos:
+                    token_id = tid
+                    break
+                    
+            if token_id is None:
+                # Token not found - use zero embedding
+                embeddings.append(torch.zeros(1, self.model_dim, device=self.device))
+                metadata_list.append(None)
+                continue
+                
+            # Get metadata
+            meta = self.token_metadata[token_id]
+            tier = meta.tier
+            
+            # Update access stats
+            meta.update_access(time.time())
+            self.recent_access_patterns.append((token_id, time.time()))
+            
+            # Try to get from memory tiers
+            if token_id in self.memory_tiers[tier]:
+                token_data = self.memory_tiers[tier][token_id]
+                
+                if token_data["compressed"] and not return_compressed:
+                    # Decompress
+                    embedding = self.compression_engine.decompress_token(
+                        token_data["compressed_data"], token_data["metadata"])
+                else:
+                    embedding = token_data["embedding"]
+                    
+                embeddings.append(embedding)
+                metadata_list.append(meta if return_metadata else None)
+                
+                # Consider promoting frequently accessed tokens
+                if meta.access_count > 5 and tier not in [NeuralMemoryTier.FOCUS, NeuralMemoryTier.ACTIVE, NeuralMemoryTier.FOREGROUND]:
+                    self._promote_token(token_id)
+                    
+                self.stats["token_retrievals"] += 1
+            else:
+                # Try to load from offloaded storage
+                loaded = self._load_token_from_offload(token_id)
+                
+                if loaded:
+                    token_data = self.memory_tiers[tier][token_id]
+                    
+                    if token_data["compressed"] and not return_compressed:
+                        # Decompress
+                        embedding = self.compression_engine.decompress_token(
+                            token_data["compressed_data"], token_data["metadata"])
+                    else:
+                        embedding = token_data["embedding"]
+                        
+                    embeddings.append(embedding)
+                    metadata_list.append(meta if return_metadata else None)
+                    self.stats["token_retrievals"] += 1
+                    self.stats["token_loads"] += 1
+                else:
+                    # Token not found even in offload - use zero embedding
+                    embeddings.append(torch.zeros(1, self.model_dim, device=self.device))
+                    metadata_list.append(None)
+                    
+        # Stack embeddings
+        if embeddings:
+            result_embeddings = torch.cat(embeddings, dim=0)
+            if return_metadata:
+                return result_embeddings, metadata_list
+            else:
+                return result_embeddings
+        else:
+            # Return empty tensor
+            empty_result = torch.zeros(0, self.model_dim, device=self.device)
+            if return_metadata:
+                return empty_result, []
+            else:
+                return empty_result
+                
+    def retrieve_by_sequence(
+        self, 
+        sequence_id: str,
+        return_metadata: bool = True
+    ) -> Union[Tensor, Tuple[Tensor, List[TokenMetadata]]]:
+        """
+        Retrieve all tokens from a given sequence
+        
+        Args:
+            sequence_id: Sequence ID to retrieve
+            return_metadata: Whether to return token metadata
+            
+        Returns:
+            If return_metadata is True: Tuple of (embeddings, metadata)
+            Otherwise: Just embeddings tensor
+        """
+        if sequence_id not in self.sequence_boundaries:
+            logger.warning(f"Sequence ID {sequence_id} not found")
+            empty_result = torch.zeros(0, self.model_dim, device=self.device)
+            if return_metadata:
+                return empty_result, []
+            else:
+                return empty_result
+                
+        start_pos, end_pos = self.sequence_boundaries[sequence_id]
+        positions = list(range(start_pos, end_pos))
+        
+        return self.retrieve_tokens(positions, return_metadata=return_metadata)
+    
+    def retrieve_by_semantic(
+        self, 
         query_embedding: Tensor,
-        top_k: int = 5
-    ) -> List[Tuple[str, float]]:
+        top_k: int = 5,
+        threshold: float = 0.7,
+        return_metadata: bool = True
+    ) -> Union[Tensor, Tuple[Tensor, List[TokenMetadata], List[float]]]:
         """
-        Find memory segments semantically similar to the query
+        Retrieve tokens semantically similar to the query embedding
         
         Args:
             query_embedding: Query embedding tensor
             top_k: Number of results to return
+            threshold: Similarity threshold (0-1)
+            return_metadata: Whether to return token metadata
             
         Returns:
-            List of (memory_id, similarity_score) pairs
+            If return_metadata is True: Tuple of (embeddings, metadata, similarities)
+            Otherwise: Just embeddings tensor
         """
-        if not self.enable_clustering:
-            return []
-            
-        return self.memory_manager.find_similar_memories(
-            query_embedding=query_embedding,
-            top_k=top_k,
-            similarity_threshold=0.7
-        )
+        if not self.enable_vector_index or self.vector_index is None:
+            logger.warning("Vector index not enabled or initialized")
+            empty_result = torch.zeros(0, self.model_dim, device=self.device)
+            if return_metadata:
+                return empty_result, [], []
+            else:
+                return empty_result
         
-    def prefetch_memories(self, hidden_states: Tensor) -> List[str]:
+        # Ensure query is on the correct device
+        if query_embedding.device != self.device:
+            query_embedding = query_embedding.to(self.device)
+            
+        # Get semantic vector
+        if self.compression_engine.semantic_encoder is not None:
+            with torch.no_grad():
+                semantic_vector = self.compression_engine.semantic_encoder(query_embedding).cpu().numpy()
+                # Normalize for cosine similarity
+                norm = np.linalg.norm(semantic_vector)
+                if norm > 0:
+                    semantic_vector = semantic_vector / norm
+        else:
+            # Use raw embedding if no encoder
+            semantic_vector = query_embedding.cpu().numpy()
+            norm = np.linalg.norm(semantic_vector)
+            if norm > 0:
+                semantic_vector = semantic_vector / norm
+                
+        try:
+            # Search the index
+            D, I = self.vector_index.search(semantic_vector.reshape(1, -1), min(top_k, len(self.vector_index_to_token)))
+            
+            # Filter by threshold
+            valid_indices = [i for i, d in zip(I[0], D[0]) if d >= threshold and i < len(self.vector_index_to_token)]
+            
+            # Get token IDs
+            token_ids = [self.vector_index_to_token[idx] for idx in valid_indices]
+            similarities = [float(D[0][i]) for i, idx in enumerate(valid_indices)]
+            
+            # Retrieve tokens
+            embeddings = []
+            metadata_list = []
+            
+            for tid in token_ids:
+                if tid in self.token_metadata:
+                    meta = self.token_metadata[tid]
+                    tier = meta.tier
+                    
+                    # Update access stats
+                    meta.update_access(time.time())
+                    
+                    # Get embedding
+                    if tid in self.memory_tiers[tier]:
+                        token_data = self.memory_tiers[tier][tid]
+                        
+                        if token_data["compressed"]:
+                            # Decompress
+                            embedding = self.compression_engine.decompress_token(
+                                token_data["compressed_data"], token_data["metadata"])
+                        else:
+                            embedding = token_data["embedding"]
+                            
+                        embeddings.append(embedding)
+                        metadata_list.append(meta if return_metadata else None)
+                    else:
+                        # Try to load from offload
+                        loaded = self._load_token_from_offload(tid)
+                        
+                        if loaded:
+                            token_data = self.memory_tiers[tier][tid]
+                            
+                            if token_data["compressed"]:
+                                # Decompress
+                                embedding = self.compression_engine.decompress_token(
+                                    token_data["compressed_data"], token_data["metadata"])
+                            else:
+                                embedding = token_data["embedding"]
+                                
+                            embeddings.append(embedding)
+                            metadata_list.append(meta if return_metadata else None)
+            
+            # Stack embeddings if any found
+            if embeddings:
+                result_embeddings = torch.cat(embeddings, dim=0)
+                if return_metadata:
+                    return result_embeddings, metadata_list, similarities[:len(embeddings)]
+                else:
+                    return result_embeddings
+            else:
+                empty_result = torch.zeros(0, self.model_dim, device=self.device)
+                if return_metadata:
+                    return empty_result, [], []
+                else:
+                    return empty_result
+                    
+        except Exception as e:
+            logger.warning(f"Error in semantic retrieval: {e}")
+            empty_result = torch.zeros(0, self.model_dim, device=self.device)
+            if return_metadata:
+                return empty_result, [], []
+            else:
+                return empty_result
+    
+    def get_context_window(
+        self, 
+        window_size: int,
+        start_position: Optional[int] = None,
+        return_importance: bool = False,
+        return_metadata: bool = False
+    ) -> Union[Tensor, Tuple[Tensor, Tensor], Tuple[Tensor, List[TokenMetadata]]]:
         """
-        Predict which memories will be needed next and prefetch them
+        Get a context window of token embeddings
         
         Args:
-            hidden_states: Current hidden states
+            window_size: Size of the context window
+            start_position: Starting position (or current position - window_size if None)
+            return_importance: Whether to return importance scores
+            return_metadata: Whether to return token metadata
             
         Returns:
-            List of prefetched memory IDs
+            Token embeddings tensor or tuple with additional information
         """
-        if not self.enable_prefetching:
-            return []
+        if start_position is None:
+            start_position = max(0, self.current_position - window_size)
             
-        # Generate prefetch embeddings
-        prefetch_emb = self.prefetch_predictor(hidden_states[:, -1])  # Use last token
+        positions = list(range(start_position, start_position + window_size))
         
-        # Find similar memories
-        prefetched = []
-        for i in range(prefetch_emb.shape[0]):
-            similar = self.find_similar_memories(prefetch_emb[i], top_k=3)
-            prefetched.extend([mem_id for mem_id, _ in similar])
-            
-        return prefetched
-        
-    def compress_memory_state(
-        self,
-        state: Dict[str, Tensor],
-        tier: MemoryTier,
-        importance: float = 0.5
-    ) -> Tuple[Dict[str, Dict[str, Tensor]], Dict[str, Dict[str, Any]]]:
-        """
-        Compress memory state for efficient storage
-        
-        Args:
-            state: Memory state dictionary
-            tier: Memory tier (affects compression ratio)
-            importance: Importance score (affects compression quality)
-            
-        Returns:
-            Tuple of (compressed_tensors, compression_metadata)
-        """
-        if not self.enable_quantization:
-            return state, {"compressed": False}
-            
-        # Determine compression ratio based on tier
-        ratio = 1.0
-        if tier == MemoryTier.WARM:
-            ratio = 0.5
-        elif tier == MemoryTier.COLD:
-            ratio = 0.25
-        elif tier == MemoryTier.ARCHIVED:
-            ratio = 0.1
-            
-        # Compress each tensor in the state
-        compressed_tensors = {}
-        compression_metadata = {}
-        
-        for key, tensor in state.items():
-            if not torch.is_tensor(tensor):
-                compressed_tensors[key] = tensor
-                continue
+        if return_metadata:
+            embeddings, metadata = self.retrieve_tokens(positions, return_metadata=True)
+            if return_importance:
+                importance = torch.tensor([m.importance if m is not None else 0.0 for m in metadata],
+                                       device=embeddings.device)
+                return embeddings, importance, metadata
+            else:
+                return embeddings, metadata
+        else:
+            if return_importance:
+                embeddings, metadata = self.retrieve_tokens(positions, return_metadata=True)
+                importance = torch.tensor([m.importance if m is not None else 0.0 for m in metadata],
+                                       device=embeddings.device)
+                return embeddings, importance
+            else:
+                return self.retrieve_tokens(positions, return_metadata=False)
                 
-            # Skip small tensors
-            if tensor.numel() < 1000:
-                compressed_tensors[key] = tensor
-                compression_metadata[key] = {"algorithm": "none", "ratio": 1.0}
-                continue
-                
-            # Compress tensor
-            tensors, metadata = self.compression_engine.compress_tensor(
-                tensor, 
-                ratio=ratio,
-                importance=importance
+    def get_recursive_memory_usage(self, obj, visited=None):
+        """Recursively calculate memory usage of nested structures"""
+        if visited is None:
+            visited = set()
+            
+        obj_id = id(obj)
+        if obj_id in visited:
+            return 0
+            
+        visited.add(obj_id)
+        size = sys.getsizeof(obj)
+        
+        if isinstance(obj, dict):
+            size += sum(self.get_recursive_memory_usage(k, visited) + 
+                        self.get_recursive_memory_usage(v, visited) 
+                        for k, v in obj.items())
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            size += sum(self.get_recursive_memory_usage(i, visited) for i in obj)
+        elif isinstance(obj, torch.Tensor):
+            # Already counted by sys.getsizeof, but add any storage not counted
+            if obj.is_quantized:
+                # Add quantization scales and zero points
+                size += obj.q_scale().numel() * obj.q_scale().element_size()
+                if obj.q_zero_point() is not None:
+                    size += obj.q_zero_point().numel() * obj.q_zero_point().element_size()
+            
+        return size
+            
+    def _maintain_memory_tiers(self) -> None:
+        """
+        Maintain memory tiers by compressing, migrating, and offloading tokens
+        to keep memory usage within limits while preserving a 100M+ context
+        """
+        # Skip if we've just done this recently (avoid excessive maintenance)
+        if self.stats["token_additions"] % 1000 != 0 and not self._is_memory_critical():
+            return
+            
+        self.stats["memory_maintenance_runs"] += 1
+        logger.debug("Running memory tier maintenance")
+        
+        # Process tiers from smallest/closest to largest/farthest
+        
+        # Step 1: FOCUS -> ACTIVE tier management
+        focus_count = len(self.memory_tiers[NeuralMemoryTier.FOCUS])
+        if focus_count > self.max_focus_tokens:
+            # Sort tokens by importance (lowest first)
+            focus_tokens = sorted(
+                [(tid, self.token_metadata[tid].importance) for tid in self.memory_tiers[NeuralMemoryTier.FOCUS]],
+                key=lambda x: x[1]
             )
             
-            compressed_tensors[key] = tensors
-            compression_metadata[key] = metadata
-            
-        return compressed_tensors, compression_metadata
-        
-    def decompress_memory_state(
-        self,
-        compressed_tensors: Dict[str, Dict[str, Tensor]],
-        compression_metadata: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Tensor]:
-        """
-        Decompress memory state
-        
-        Args:
-            compressed_tensors: Dictionary of compressed tensors
-            compression_metadata: Compression metadata
-            
-        Returns:
-            Decompressed memory state
-        """
-        if not compression_metadata:
-            return compressed_tensors
-            
-        decompressed_state = {}
-        
-        for key, tensors in compressed_tensors.items():
-            if key not in compression_metadata:
-                decompressed_state[key] = tensors
-                continue
+            # Migrate least important tokens to ACTIVE tier
+            to_migrate = focus_count - self.max_focus_tokens
+            for tid, _ in focus_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.FOCUS, NeuralMemoryTier.ACTIVE)
                 
-            metadata = compression_metadata[key]
+        # Step 2: ACTIVE -> FOREGROUND tier management
+        active_count = len(self.memory_tiers[NeuralMemoryTier.ACTIVE])
+        if active_count > self.max_active_tokens:
+            # Sort tokens by position (oldest first)
+            active_tokens = sorted(
+                [(tid, self.token_metadata[tid].position) for tid in self.memory_tiers[NeuralMemoryTier.ACTIVE]],
+                key=lambda x: x[1]
+            )
             
-            if metadata.get("algorithm", "none") == "none":
-                decompressed_state[key] = tensors
-                continue
+            # Migrate oldest tokens to FOREGROUND tier
+            to_migrate = active_count - self.max_active_tokens
+            for tid, _ in active_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.ACTIVE, NeuralMemoryTier.FOREGROUND)
                 
-            # Decompress tensor
-            decompressed = self.compression_engine.decompress_tensor(tensors, metadata)
-            decompressed_state[key] = decompressed
+        # Step 3: FOREGROUND -> BACKGROUND tier management
+        foreground_count = len(self.memory_tiers[NeuralMemoryTier.FOREGROUND])
+        if foreground_count > self.max_foreground_tokens:
+            # Sort tokens by position (oldest first) AND importance (lowest first)
+            # This weighted approach keeps important tokens in the foreground longer
+            foreground_tokens = sorted(
+                [(tid, self.token_metadata[tid].position, self.token_metadata[tid].importance) 
+                 for tid in self.memory_tiers[NeuralMemoryTier.FOREGROUND]],
+                key=lambda x: (x[1] - self.current_position) * (1.0 - x[2])  # Age multiplied by (1-importance)
+            )
             
-        return decompressed_state
+            # Migrate oldest tokens to BACKGROUND tier
+            to_migrate = foreground_count - self.max_foreground_tokens
+            for tid, _, _ in foreground_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.FOREGROUND, NeuralMemoryTier.BACKGROUND)
         
-    def checkpoint_memory_state(self, memory_id: str, path: str) -> bool:
-        """Save memory state to a checkpoint file"""
-        if not self.recovery_enabled:
+        # Step 4: BACKGROUND -> lower tiers based on specialized characteristics
+        background_count = len(self.memory_tiers[NeuralMemoryTier.BACKGROUND])
+        if background_count > self.max_background_tokens:
+            # Sort tokens by position and importance
+            background_tokens = sorted(
+                [(tid, self.token_metadata[tid].position, self.token_metadata[tid].importance) 
+                 for tid in self.memory_tiers[NeuralMemoryTier.BACKGROUND]],
+                key=lambda x: (x[1] - self.current_position) * (1.0 - x[2])
+            )
+            
+            # Migrate tokens to appropriate tiers based on characteristics
+            to_migrate = background_count - self.max_background_tokens
+            for tid, _, importance in background_tokens[:to_migrate]:
+                meta = self.token_metadata[tid]
+                
+                # Pick appropriate tier based on token characteristics
+                if importance > self.semantic_extraction_threshold:
+                    # High importance tokens go to semantic memory
+                    target_tier = NeuralMemoryTier.SEMANTIC
+                elif meta.position > self.current_position - 1000000:
+                    # Recent enough for episodic memory
+                    target_tier = NeuralMemoryTier.EPISODIC
+                else:
+                    # Otherwise general memory
+                    target_tier = NeuralMemoryTier.GENERAL
+                    
+                self._migrate_token(tid, NeuralMemoryTier.BACKGROUND, target_tier)
+                
+        # Step 5: Manage mid-tier memories (EPISODIC, SEMANTIC, GENERAL)
+        
+        # 5.1: EPISODIC memory management
+        episodic_count = len(self.memory_tiers[NeuralMemoryTier.EPISODIC])
+        if episodic_count > self.max_episodic_tokens:
+            episodic_tokens = sorted(
+                [(tid, self.token_metadata[tid].position) for tid in self.memory_tiers[NeuralMemoryTier.EPISODIC]],
+                key=lambda x: x[1]  # Sort by position (oldest first)
+            )
+            
+            to_migrate = episodic_count - self.max_episodic_tokens
+            for tid, _ in episodic_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.EPISODIC, NeuralMemoryTier.GENERAL)
+                
+        # 5.2: SEMANTIC memory management
+        semantic_count = len(self.memory_tiers[NeuralMemoryTier.SEMANTIC])
+        if semantic_count > self.max_semantic_tokens:
+            semantic_tokens = sorted(
+                [(tid, self.token_metadata[tid].importance) for tid in self.memory_tiers[NeuralMemoryTier.SEMANTIC]],
+                key=lambda x: x[1]  # Sort by importance (lowest first)
+            )
+            
+            to_migrate = semantic_count - self.max_semantic_tokens
+            for tid, _ in semantic_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.SEMANTIC, NeuralMemoryTier.CATEGORICAL)
+                
+        # 5.3: GENERAL memory management
+        general_count = len(self.memory_tiers[NeuralMemoryTier.GENERAL])
+        if general_count > self.max_general_tokens:
+            general_tokens = sorted(
+                [(tid, self.token_metadata[tid].position) for tid in self.memory_tiers[NeuralMemoryTier.GENERAL]],
+                key=lambda x: x[1]  # Sort by position (oldest first)
+            )
+            
+            to_migrate = general_count - self.max_general_tokens
+            for tid, _ in general_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.GENERAL, NeuralMemoryTier.CATEGORICAL)
+                
+        # Step 6: Deep memory tier management (CATEGORICAL, ARCHIVAL, REFERENCE, CONSOLIDATED)
+        
+        # 6.1: CATEGORICAL memory management
+        categorical_count = len(self.memory_tiers[NeuralMemoryTier.CATEGORICAL])
+        if categorical_count > self.max_categorical_tokens:
+            categorical_tokens = sorted(
+                [(tid, self.token_metadata[tid].position) for tid in self.memory_tiers[NeuralMemoryTier.CATEGORICAL]],
+                key=lambda x: x[1]  # Sort by position (oldest first)
+            )
+            
+            to_migrate = categorical_count - self.max_categorical_tokens
+            for tid, _ in categorical_tokens[:to_migrate]:
+                self._migrate_token(tid, NeuralMemoryTier.CATEGORICAL, NeuralMemoryTier.ARCHIVAL)
+                
+        # 6.2: ARCHIVAL memory management
+        archival_count = len(self.memory_tiers[NeuralMemoryTier.ARCHIVAL])
+        if archival_count > self.max_archival_tokens:
+            archival_tokens = sorted(
+                [(tid, self.token_metadata[tid].position) for tid in self.memory_tiers[NeuralMemoryTier.ARCHIVAL]],
+                key=lambda x: x[1]  # Sort by position (oldest first)
+            )
+            
+            to_migrate = archival_count - self.max_archival_tokens
+            for tid, _ in archival_tokens[:to_migrate]:
+                # For extremely old tokens, consider consolidation or pruning
+                meta = self.token_metadata[tid]
+                if meta.importance < self.pruning_threshold and self.token_pruning:
+                    self._prune_token(tid)
+                    self.stats["token_prunings"] += 1
+                else:
+                    # Alternate between REFERENCE and CONSOLIDATED
+                    target_tier = NeuralMemoryTier.REFERENCE if random.random() < 0.5 else NeuralMemoryTier.CONSOLIDATED
+                    self._migrate_token(tid, NeuralMemoryTier.ARCHIVAL, target_tier)
+         
+        # Step 7: Apply token pruning for distant tokens if enabled
+        if self.token_pruning:
+            # Identify pruning candidates from lower tiers
+            pruning_candidates = []
+            for tier in [NeuralMemoryTier.CATEGORICAL, NeuralMemoryTier.ARCHIVAL, 
+                        NeuralMemoryTier.REFERENCE, NeuralMemoryTier.CONSOLIDATED]:
+                for tid in list(self.memory_tiers[tier].keys()):
+                    meta = self.token_metadata[tid]
+                    distance = self.current_position - meta.position
+                    
+                    if distance >= self.min_pruning_distance:
+                        # Calculate pruning score (higher = more prunable)
+                        # Factors: low importance, high distance, low access frequency
+                        pruning_score = (
+                            (1.0 - meta.importance) * 0.6 +  # Low importance (60% weight)
+                            min(1.0, distance / 10000000) * 0.3 +  # Distance (30% weight)
+                            max(0.0, 1.0 - (meta.access_count / 100)) * 0.1  # Low access (10% weight)
+                        )
+                        
+                        # Only consider if score is high enough
+                        if pruning_score > 0.7:
+                            pruning_candidates.append((tid, pruning_score))
+            
+            # Sort and prune up to a percentage of tokens
+            if pruning_candidates:
+                # Sort by score (highest first)
+                pruning_candidates.sort(key=lambda x: -x[1])
+                
+                # Determine how many tokens to prune
+                resident_count = sum(len(self.memory_tiers[tier]) for tier in NeuralMemoryTier)
+                max_prune = min(len(pruning_candidates), max(1, int(resident_count * 0.01)))  # Max 1% at a time
+                
+                # Prune tokens
+                for tid, _ in pruning_candidates[:max_prune]:
+                    self._prune_token(tid)
+                    self.stats["token_prunings"] += 1
+                    
+        # Step 8: Offload tokens if we exceed resident memory limit
+        resident_count = sum(len(self.memory_tiers[tier]) for tier in NeuralMemoryTier)
+        
+        if resident_count > self.max_memory_resident_tokens:
+            # Focus on oldest tokens from colder tiers first
+            offload_candidates = []
+            for tier in [NeuralMemoryTier.CONSOLIDATED, NeuralMemoryTier.REFERENCE, 
+                         NeuralMemoryTier.ARCHIVAL, NeuralMemoryTier.CATEGORICAL,
+                         NeuralMemoryTier.GENERAL]:
+                for tid in self.memory_tiers[tier]:
+                    meta = self.token_metadata[tid]
+                    distance = self.current_position - meta.position
+                    last_access = meta.last_access_time
+                    access_count = meta.access_count
+                    
+                    # Score based on distance, recency, and access frequency
+                    score = distance * 0.5 + (time.time() - last_access) * 0.3 - access_count * 10
+                    offload_candidates.append((tid, score))
+                    
+            # Sort by score (highest first - most offloadable)
+            offload_candidates.sort(key=lambda x: -x[1])
+            
+            # Offload enough tokens to get under the limit
+            to_offload = resident_count - self.max_memory_resident_tokens
+            for tid, _ in offload_candidates[:to_offload]:
+                self._offload_token(tid)
+                self.stats["token_offloads"] += 1
+                
+        # Step 9: Consolidate memory if needed
+        if self.current_position >= self.memory_consolidation_interval and self.current_position % self.memory_consolidation_interval == 0:
+            self._consolidate_memory()
+            
+        # Step 10: Auto-scale memory tiers if enabled
+        if self.auto_scaling and self.current_position > 10000:
+            self._auto_scale_memory_tiers()
+            
+    def _is_memory_critical(self) -> bool:
+        """Check if memory usage is critical and requires immediate maintenance"""
+        # Check if any tier is over 95% capacity
+        critical_tiers = [
+            NeuralMemoryTier.FOCUS,
+            NeuralMemoryTier.ACTIVE,
+            NeuralMemoryTier.FOREGROUND,
+            NeuralMemoryTier.BACKGROUND
+        ]
+        
+        for tier in critical_tiers:
+            max_size = getattr(self, f"max_{tier.name.lower()}_tokens")
+            current_size = len(self.memory_tiers[tier])
+            if current_size > max_size * 0.95:
+                return True
+                
+        # Check if total resident token count is near limit
+        resident_count = sum(len(self.memory_tiers[tier]) for tier in NeuralMemoryTier)
+        if resident_count > self.max_memory_resident_tokens * 0.95:
+            return True
+            
+        return False
+            
+    def _migrate_token(
+        self, 
+        token_id: int, 
+        from_tier: NeuralMemoryTier, 
+        to_tier: NeuralMemoryTier
+    ) -> bool:
+        """Migrate a token from one tier to another with appropriate compression"""
+        if token_id not in self.memory_tiers[from_tier]:
             return False
             
-        try:
-            # Get memory segment
-            segment = self.memory_manager.get_memory_segment(memory_id)
-            if segment is None:
-                return False
+        # Get token data and metadata
+        token_data = self.memory_tiers[from_tier][token_id]
+        meta = self.token_metadata[token_id]
+        
+        # Update memory usage tracking
+        if token_data["compressed"]:
+            # For compressed tokens, calculate size based on compressed data
+            size = sum(t.nelement() * t.element_size() for t in token_data["compressed_data"].values())
+        else:
+            # For uncompressed tokens, use embedding size
+            size = token_data["embedding"].nelement() * token_data["embedding"].element_size()
+            
+        self.memory_usage_by_tier[from_tier] -= size
+        self.memory_usage_by_tier[to_tier] += size
+        
+        # Move token to new tier
+        self.memory_tiers[to_tier][token_id] = token_data
+        del self.memory_tiers[from_tier][token_id]
+        
+        # Update metadata
+        meta.tier = to_tier
+        
+        # Apply compression if needed when moving to a colder tier
+        if self.enable_tensor_compression and not token_data["compressed"]:
+            # Tiers that require compression
+            compression_tiers = [
+                NeuralMemoryTier.BACKGROUND,
+                NeuralMemoryTier.EPISODIC,
+                NeuralMemoryTier.SEMANTIC,
+                NeuralMemoryTier.GENERAL,
+                NeuralMemoryTier.CATEGORICAL,
+                NeuralMemoryTier.ARCHIVAL,
+                NeuralMemoryTier.REFERENCE,
+                NeuralMemoryTier.CONSOLIDATED
+            ]
+            
+            if to_tier in compression_tiers:
+                # Determine distance for compression ratio
+                distance = self.current_position - meta.position
+                self._compress_token(token_id, distance)
                 
-            # Save state dict
-            torch.save(segment.state_dict(), path)
-            logger.info(f"Memory state checkpoint saved to {path}")
+        return True
+        
+    def _compress_token(self, token_id: int, distance: int) -> bool:
+        """Compress a token's embedding based on its distance and characteristics"""
+        if token_id not in self.token_metadata:
+            return False
+            
+        meta = self.token_metadata[token_id]
+        tier = meta.tier
+        
+        if token_id not in self.memory_tiers[tier]:
+            return False
+            
+        token_data = self.memory_tiers[tier][token_id]
+        
+        # Skip if already compressed
+        if token_data["compressed"]:
+            return False
+            
+        # Get embedding and importance
+        embedding = token_data["embedding"]
+        importance = meta.importance
+        token_type = meta.token_type
+        
+        # Apply compression
+        compressed_data, metadata = self.compression_engine.compress_token(
+            embedding, distance, importance, token_type, tier
+        )
+        
+        # Update token data
+        old_size = embedding.nelement() * embedding.element_size()
+        
+        # Calculate new size
+        new_size = sum(t.nelement() * t.element_size() for t in compressed_data.values())
+        
+        # Update memory usage
+        self.total_memory_usage = self.total_memory_usage - old_size + new_size
+        self.memory_usage_by_tier[tier] = self.memory_usage_by_tier[tier] - old_size + new_size
+        
+        # Store compressed data
+        self.memory_tiers[tier][token_id] = {
+            "compressed_data": compressed_data,
+            "metadata": metadata,
+            "compressed": True
+        }
+        
+        # Update token metadata
+        meta.compression_ratio = metadata.get("ratio", 1.0)
+        meta.compressed = True
+        meta.precision_bits = metadata.get("bits", 32)
+        
+        return True
+        
+    def _offload_token(self, token_id: int) -> bool:
+        """Offload a token to disk storage"""
+        if token_id not in self.token_metadata:
+            return False
+            
+        meta = self.token_metadata[token_id]
+        tier = meta.tier
+        
+        if token_id not in self.memory_tiers[tier]:
+            return False
+            
+        # Get token data
+        token_data = self.memory_tiers[tier][token_id]
+        
+        # Ensure token is compressed before offloading
+        if not token_data["compressed"] and self.enable_tensor_compression:
+            distance = self.current_position - meta.position
+            self._compress_token(token_id, distance)
+            token_data = self.memory_tiers[tier][token_id]
+            
+        # Create offload file path
+        offload_path = os.path.join(self.offload_path, f"token_{token_id}.pt")
+        
+        try:
+            # Save token data and metadata
+            torch.save({
+                "token_data": token_data,
+                "metadata": meta
+            }, offload_path)
+            
+            # Update memory usage
+            if token_data["compressed"]:
+                size = sum(t.nelement() * t.element_size() for t in token_data["compressed_data"].values())
+            else:
+                size = token_data["embedding"].nelement() * token_data["embedding"].element_size()
+                
+            self.total_memory_usage -= size
+            self.memory_usage_by_tier[tier] -= size
+            
+            # Remove from memory
+            del self.memory_tiers[tier][token_id]
+            
+            # Update metadata
+            meta.offloaded = True
+            meta.offload_path = offload_path
+            
+            # Update token tier to OFFLOADED
+            meta.tier = NeuralMemoryTier.OFFLOADED
+            
             return True
         except Exception as e:
-            logger.warning(f"Failed to save memory checkpoint: {e}")
+            logger.error(f"Failed to offload token {token_id}: {e}")
             return False
             
-    def load_memory_state(self, path: str) -> Optional[str]:
-        """Load memory state from a checkpoint file"""
-        if not self.recovery_enabled:
-            return None
+    def _load_token_from_offload(self, token_id: int) -> bool:
+        """Load a token from offload storage"""
+        if token_id not in self.token_metadata:
+            return False
             
-        try:
-            state_dict = torch.load(path)
-            segment = MemorySegment.from_state_dict(state_dict)
-            
-            # Add to memory manager
-            self.memory_manager.add_memory_segment(segment)
-            
-            logger.info(f"Memory state loaded from {path}")
-            return segment.memory_id
-        except Exception as e:
-            logger.warning(f"Failed to load memory checkpoint: {e}")
-            return None
-            
-    def store_memories(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        memory_id: Optional[str] = None
-    ) -> str:
-        """
-        Store memories from hidden states
+        meta = self.token_metadata[token_id]
         
-        Args:
-            hidden_states: Hidden states tensor
-            attention_mask: Optional attention mask
-            memory_id: Optional existing memory ID to update
+        # Skip if already in memory
+        for tier in NeuralMemoryTier:
+            if token_id in self.memory_tiers[tier]:
+                return True
+                
+        # Get offload path
+        offload_path = meta.offload_path
+        if not offload_path or not os.path.exists(offload_path):
+            # Try default path
+            offload_path = os.path.join(self.offload_path, f"token_{token_id}.pt")
+            if not os.path.exists(offload_path):
+                return False
+                
+        try:
+            # Load token data
+            data = torch.load(offload_path)
             
-        Returns:
-            Memory ID
-        """
-        # Create new memory segment or update existing one
-        if memory_id is None:
-            memory_id = self.create_memory_segment(hidden_states, attention_mask)
+            # Get token data and metadata
+            token_data = data["token_data"]
+            loaded_meta = data["metadata"]
+            
+            # Determine appropriate tier
+            tier = loaded_meta.tier
+            if tier == NeuralMemoryTier.OFFLOADED:
+                # Place in ARCHIVED tier when loading
+                tier = NeuralMemoryTier.ARCHIVAL
+                
+            # Add back to memory
+            self.memory_tiers[tier][token_id] = token_data
+            
+            # Update memory usage
+            if token_data["compressed"]:
+                size = sum(t.nelement() * t.element_size() for t in token_data["compressed_data"].values())
+            else:
+                size = token_data["embedding"].nelement() * token_data["embedding"].element_size()
+                
+            self.total_memory_usage += size
+            self.memory_usage_by_tier[tier] += size
+            
+            # Update metadata
+            meta.offloaded = False
+            meta.tier = tier
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load token {token_id} from offload: {e}")
+            return False
+            
+    def _promote_token(self, token_id: int) -> bool:
+        """Promote a token to a higher tier based on importance and usage"""
+        if token_id not in self.token_metadata:
+            return False
+            
+        meta = self.token_metadata[token_id]
+        current_tier = meta.tier
+        
+        # Skip tokens that are already in high tiers
+        if current_tier in [NeuralMemoryTier.FOCUS, NeuralMemoryTier.ACTIVE, NeuralMemoryTier.FOREGROUND]:
+            return False
+            
+        # Determine target tier based on importance, recency and current tier
+        importance = meta.importance
+        recency = 1.0 - min(1.0, (self.current_position - meta.position) / 1000000)
+        access_score = min(1.0, meta.access_count / 10.0)
+        
+        # Combined promotion score
+        promotion_score = importance * 0.4 + recency * 0.4 + access_score * 0.2
+        
+        # Only promote if score is high enough
+        if promotion_score < 0.6:
+            return False
+            
+        # Define promotion paths
+        promotion_paths = {
+            NeuralMemoryTier.BACKGROUND: NeuralMemoryTier.FOREGROUND,
+            NeuralMemoryTier.EPISODIC: NeuralMemoryTier.BACKGROUND,
+            NeuralMemoryTier.SEMANTIC: NeuralMemoryTier.BACKGROUND,
+            NeuralMemoryTier.GENERAL: NeuralMemoryTier.EPISODIC,
+            NeuralMemoryTier.CATEGORICAL: NeuralMemoryTier.GENERAL,
+            NeuralMemoryTier.ARCHIVAL: NeuralMemoryTier.CATEGORICAL,
+            NeuralMemoryTier.REFERENCE: NeuralMemoryTier.GENERAL,
+            NeuralMemoryTier.CONSOLIDATED: NeuralMemoryTier.SEMANTIC,
+            NeuralMemoryTier.OFFLOADED: NeuralMemoryTier.ARCHIVAL
+        }
+        
+        # Get target tier
+        if current_tier in promotion_paths:
+            target_tier = promotion_paths[current_tier]
         else:
-            # Update existing memory
-            for i in range(hidden_states.shape[0]):
-                batch_id = f"{memory_id}_b{i}"
-                self.memory_manager.update_memory_segment(
-                    batch_id,
-                    {
-                        "hidden_states": hidden_states[i],
-                        "attention_mask": attention_mask[i] if attention_mask is not None else None
-                    }
+            # No defined promotion path
+            return False
+            
+        # Ensure token is in memory
+        if current_tier == NeuralMemoryTier.OFFLOADED:
+            if not self._load_token_from_offload(token_id):
+                return False
+                
+        # Migrate to target tier
+        success = self._migrate_token(token_id, current_tier, target_tier)
+        
+        # If token was compressed and moving to a higher tier, decompress it
+        if success and target_tier in [NeuralMemoryTier.FOCUS, NeuralMemoryTier.ACTIVE, NeuralMemoryTier.FOREGROUND]:
+            token_data = self.memory_tiers[target_tier][token_id]
+            if token_data["compressed"]:
+                # Decompress and update
+                decompressed = self.compression_engine.decompress_token(
+                    token_data["compressed_data"], token_data["metadata"])
+                
+                # Update memory usage
+                old_size = sum(t.nelement() * t.element_size() for t in token_data["compressed_data"].values())
+                new_size = decompressed.nelement() * decompressed.element_size()
+                
+                self.total_memory_usage = self.total_memory_usage - old_size + new_size
+                self.memory_usage_by_tier[target_tier] = self.memory_usage_by_tier[target_tier] - old_size + new_size
+                
+                # Store decompressed tensor
+                self.memory_tiers[target_tier][token_id] = {
+                    "embedding": decompressed,
+                    "compressed": False
+                }
+                
+                # Update metadata
+                meta.compressed = False
+                meta.compression_ratio = 1.0
+                meta.precision_bits = 32
+                
+        # Track promotion in stats
+        if success:
+            self.stats["token_promotions"] += 1
+                
+        return success
+            
+    def _prune_token(self, token_id: int) -> bool:
+        """Completely remove a token from memory"""
+        if token_id not in self.token_metadata:
+            return False
+            
+        meta = self.token_metadata[token_id]
+        tier = meta.tier
+        
+        # Remove from memory if present
+        if tier != NeuralMemoryTier.OFFLOADED and token_id in self.memory_tiers[tier]:
+            token_data = self.memory_tiers[tier][token_id]
+            
+            # Update memory usage
+            if token_data["compressed"]:
+                size = sum(t.nelement() * t.element_size() for t in token_data["compressed_data"].values())
+            else:
+                size = token_data["embedding"].nelement() * token_data["embedding"].element_size()
+                
+            self.total_memory_usage -= size
+            self.memory_usage_by_tier[tier] -= size
+            
+            del self.memory_tiers[tier][token_id]
+            
+        # Remove from offload storage if present
+        offload_path = meta.offload_path
+        if offload_path and os.path.exists(offload_path):
+            try:
+                os.remove(offload_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove offloaded token {token_id}: {e}")
+                
+        # Remove from vector index if present
+        if self.enable_vector_index and self.vector_index is not None:
+            try:
+                if token_id in self.vector_index_to_token:
+                    idx = self.vector_index_to_token.index(token_id)
+                    # Note: We can't easily remove from FAISS index, so we just remove from the mapping
+                    self.vector_index_to_token[idx] = -1  # Mark as invalid
+            except Exception as e:
+                logger.warning(f"Error updating vector index during pruning: {e}")
+                
+        # Remove from content hash map if present
+        if self.token_deduplication:
+            for hash_val, tid in list(self.content_hash_map.items()):
+                if tid == token_id:
+                    del self.content_hash_map[hash_val]
+                    break
+                    
+        # Remove from task memory if present
+        if self.enable_task_memory and self.task_memory:
+            for task_id, tokens in self.task_memory.items():
+                if token_id in tokens:
+                    tokens.remove(token_id)
+                    
+        # Remove metadata
+        del self.token_metadata[token_id]
+        
+        return True
+        
+    def _consolidate_memory(self) -> None:
+        """
+        Perform memory consolidation by extracting semantic information
+        from groups of related tokens and creating consolidated tokens
+        that represent their collective meaning
+        """
+        # Skip if no semantic encoder available
+        if not self.enable_semantic_compression or self.compression_engine.semantic_encoder is None:
+            return
+            
+        logger.info("Performing memory consolidation")
+        
+        # Target tiers for consolidation
+        target_tiers = [
+            NeuralMemoryTier.ARCHIVAL,
+            NeuralMemoryTier.CATEGORICAL,
+            NeuralMemoryTier.GENERAL
+        ]
+        
+        # Group tokens by sequence
+        sequence_tokens = defaultdict(list)
+        
+        for tier in target_tiers:
+            for token_id in self.memory_tiers[tier]:
+                meta = self.token_metadata[token_id]
+                if meta.sequence_id:
+                    sequence_tokens[meta.sequence_id].append(token_id)
+                    
+        # Process sequences with enough tokens
+        consolidated_count = 0
+        for sequence_id, tokens in sequence_tokens.items():
+            # Only consolidate sequences with enough tokens
+            if len(tokens) < 10:
+                continue
+                
+            # Group into chunks of 10-50 tokens
+            chunk_size = min(50, max(10, len(tokens) // 10))
+            
+            # Process in chunks
+            for i in range(0, len(tokens), chunk_size):
+                chunk = tokens[i:i+chunk_size]
+                if len(chunk) < 5:  # Skip very small chunks
+                    continue
+                    
+                # Get embeddings for these tokens
+                embeddings = []
+                for tid in chunk:
+                    for tier in target_tiers:
+                        if tid in self.memory_tiers[tier]:
+                            token_data = self.memory_tiers[tier][tid]
+                            
+                            if token_data["compressed"]:
+                                embed = self.compression_engine.decompress_token(
+                                    token_data["compressed_data"], token_data["metadata"])
+                            else:
+                                embed = token_data["embedding"]
+                                
+                            embeddings.append(embed)
+                            break
+                
+                if not embeddings:
+                    continue
+                    
+                # Stack embeddings
+                chunk_embeds = torch.cat(embeddings, dim=0)
+                
+                # Calculate consolidated embedding using semantic encoder
+                with torch.no_grad():
+                    # Get semantic vectors
+                    semantic_vectors = self.compression_engine.semantic_encoder(chunk_embeds)
+                    
+                    # Average to get consolidated representation
+                    consolidated_semantic = semantic_vectors.mean(dim=0, keepdim=True)
+                    
+                    # Decode back to embedding space
+                    consolidated_embedding = self.compression_engine.semantic_decoder(consolidated_semantic)
+                
+                # Create a new consolidated token
+                consolidated_id = self.current_position + 1000000 + consolidated_count
+                consolidated_count += 1
+                
+                # Calculate average importance of consolidated tokens
+                avg_importance = sum(self.token_metadata[tid].importance for tid in chunk) / len(chunk)
+                
+                # Create metadata for consolidated token
+                meta = TokenMetadata(
+                    token_id=consolidated_id,
+                    position=consolidated_id,  # Use ID as position for consolidated tokens
+                    creation_time=time.time(),
+                    sequence_id=sequence_id,
+                    tier=NeuralMemoryTier.CONSOLIDATED,
+                    importance=avg_importance * 1.2,  # Boost importance slightly
+                    last_access_time=time.time(),
+                    token_type=0,  # Generic type for consolidated tokens
+                    compression_ratio=0.1,  # Assume high compression
+                    precision_bits=16,
+                    compressed=True,
+                    tags={"consolidated", f"seq_{sequence_id}"}
                 )
                 
-        # Checkpoint periodically if enabled
-        self.step_counter += 1
-        if self.recovery_enabled and self.step_counter % self.checkpoint_interval == 0:
-            checkpoint_path = f"memory_checkpoint_{self.step_counter}.pt"
-            self.checkpoint_memory_state(memory_id, checkpoint_path)
-            
-        return memory_id
-        
-    def retrieve_memories(
-        self,
-        query_states: Tensor,
-        retrieval_type: str = 'semantic',  # 'semantic', 'id', or 'hybrid'
-        memory_id: Optional[str] = None,
-        num_retrievals: int = 5
-    ) -> Tuple[Tensor, List[str]]:
-        """
-        Retrieve memories based on query states
-        
-        Args:
-            query_states: Query hidden states
-            retrieval_type: Type of retrieval to perform
-            memory_id: Optional specific memory ID to retrieve
-            num_retrievals: Number of items to retrieve
-            
-        Returns:
-            Tuple of (retrieved_states, memory_ids)
-        """
-        batch_size = query_states.shape[0]
-        retrieved_memories = []
-        retrieved_ids = []
-        
-        if retrieval_type == 'id' and memory_id is not None:
-            # Retrieve specific memory by ID
-            for i in range(batch_size):
-                batch_id = f"{memory_id}_b{i}"
-                memory_data = self.retrieve_memory_segment(batch_id)
+                # Add references to original tokens
+                meta.related_tokens = {tid: 1.0 for tid in chunk}
                 
-                if memory_data is not None:
-                    retrieved_memories.append(memory_data["hidden_states"])
-                    retrieved_ids.append(batch_id)
-                else:
-                    # Use empty tensor as placeholder
-                    retrieved_memories.append(torch.zeros_like(query_states[i]))
-                    retrieved_ids.append("")
-        elif retrieval_type == 'semantic' or retrieval_type == 'hybrid':
-            # Semantic retrieval
-            for i in range(batch_size):
-                # Use mean pooling for query embedding
-                query_emb = query_states[i].mean(dim=0)
+                # Store metadata
+                self.token_metadata[consolidated_id] = meta
                 
-                # Find similar memories
-                similar = self.find_similar_memories(query_emb, top_k=num_retrievals)
+                # Compress and store the consolidated token
+                compressed_data, compress_meta = self.compression_engine.compress_token(
+                    consolidated_embedding, 1000000, avg_importance, 0, NeuralMemoryTier.CONSOLIDATED
+                )
                 
-                if similar:
-                    # Retrieve and combine memories
-                    memory_tensors = []
-                    for mem_id, score in similar:
-                        memory_data = self.retrieve_memory_segment(mem_id)
-                        if memory_data is not None:
-                            memory_tensors.append((memory_data["hidden_states"], score))
-                            retrieved_ids.append(mem_id)
-                            
-                    # Combine memories using weighted average
-                    if memory_tensors:
-                        tensors, scores = zip(*memory_tensors)
-                        weights = torch.tensor(scores, device=query_states.device)
-                        weights = F.softmax(weights, dim=0)
+                # Store in memory
+                self.memory_tiers[NeuralMemoryTier.CONSOLIDATED][consolidated_id] = {
+                    "compressed_data": compressed_data,
+                    "metadata": compress_meta,
+                    "compressed": True
+                }
+                
+                # Update memory usage
+                size = sum(t.nelement() * t.element_size() for t in compressed_data.values())
+                self.total_memory_usage += size
+                self.memory_usage_by_tier[NeuralMemoryTier.CONSOLIDATED] += size
+                
+                # Prune some of the original tokens to save space
+                # Keep highest importance tokens, prune lowest
+                if self.token_pruning:
+                    # Sort by importance
+                    sorted_chunk = sorted([(tid, self.token_metadata[tid].importance) for tid in chunk],
+                                        key=lambda x: x[1])
+                    
+                    # Prune bottom third of tokens
+                    to_prune = sorted_chunk[:len(chunk)//3]
+                    for tid, _ in to_prune:
+                        self._prune_token(tid)
+                        self.stats["token_prunings"] += 1
                         
-                        combined = torch.zeros_like(query_states[i])
-                        for j, tensor in enumerate(tensors):
-                            # Handle different sequence lengths
-                            seq_len = min(combined.shape[0], tensor.shape[0])
-                            combined[:seq_len] += tensor[:seq_len] * weights[j]
-                            
-                        retrieved_memories.append(combined)
-                    else:
-                        retrieved_memories.append(torch.zeros_like(query_states[i]))
-                else:
-                    retrieved_memories.append(torch.zeros_like(query_states[i]))
-        else:
-            # Default: use zero tensors
-            for i in range(batch_size):
-                retrieved_memories.append(torch.zeros_like(query_states[i]))
-                retrieved_ids.append("")
+        # Update stats
+        self.stats["token_consolidations"] += consolidated_count
+        
+        logger.info(f"Memory consolidation complete: {consolidated_count} consolidated tokens created")
+                    
+    def _auto_scale_memory_tiers(self) -> None:
+        """
+        Automatically adjust memory tier sizes based on usage patterns
+        """
+        if not self.auto_scaling:
+            return
+            
+        # Calculate usage ratios for each tier
+        usage_ratios = {}
+        for tier in NeuralMemoryTier:
+            max_size = getattr(self, f"max_{tier.name.lower()}_tokens", 0)
+            if max_size > 0:
+                current_size = len(self.memory_tiers[tier])
+                usage_ratios[tier] = current_size / max_size
+        
+        # Find tiers that are nearly full
+        full_tiers = [tier for tier, ratio in usage_ratios.items() if ratio > 0.9]
+        
+        # Find tiers with low utilization
+        empty_tiers = [tier for tier, ratio in usage_ratios.items() if ratio < 0.3]
+        
+        # Skip if no scaling needed
+        if not full_tiers or not empty_tiers:
+            return
+            
+        # Calculate scaling factor (borrow 10% from each empty tier for each full tier)
+        scaling_factor = 0.1
+        
+        # Scale up full tiers and scale down empty tiers
+        for full_tier in full_tiers:
+            full_tier_attr = f"max_{full_tier.name.lower()}_tokens"
+            current_size = getattr(self, full_tier_attr)
+            
+            # Distribute capacity from empty tiers
+            for empty_tier in empty_tiers:
+                empty_tier_attr = f"max_{empty_tier.name.lower()}_tokens"
+                empty_size = getattr(self, empty_tier_attr)
                 
-        # Stack retrieved memories
-        stacked_memories = torch.stack(retrieved_memories, dim=0)
+                # Calculate amount to transfer
+                transfer_amount = int(empty_size * scaling_factor)
+                
+                # Scale down empty tier
+                setattr(self, empty_tier_attr, empty_size - transfer_amount)
+                
+                # Scale up full tier
+                setattr(self, full_tier_attr, current_size + transfer_amount)
+                
+                logger.debug(f"Auto-scaled: {transfer_amount} slots from {empty_tier.name} to {full_tier.name}")
+                
+                # Update current size
+                current_size += transfer_amount
         
-        return stacked_memories, retrieved_ids
+    def _create_checkpoint(self) -> str:
+        """Create a checkpoint of the current memory state"""
+        if not self.enable_checkpointing:
+            return ""
+            
+        checkpoint_id = f"checkpoint_{self.current_position}_{int(time.time())}"
+        checkpoint_path = os.path.join(self.offload_path, f"{checkpoint_id}.pt")
         
-    def forward(
+        try:
+            # Create simplified state for checkpoint (metadata only)
+            checkpoint_data = {
+                "current_position": self.current_position,
+                "token_metadata": self.token_metadata,
+                "sequence_boundaries": self.sequence_boundaries,
+                "timestamp": time.time(),
+                "stats": self.stats
+            }
+            
+            torch.save(checkpoint_data, checkpoint_path)
+            logger.info(f"Created memory checkpoint at position {self.current_position}")
+            
+            return checkpoint_id
+        except Exception as e:
+            logger.error(f"Failed to create checkpoint: {e}")
+            return ""
+            
+    def restore_from_checkpoint(self, checkpoint_id: str) -> bool:
+        """Restore memory state from a checkpoint"""
+        checkpoint_path = os.path.join(self.offload_path, f"{checkpoint_id}.pt")
+        
+        if not os.path.exists(checkpoint_path):
+            logger.error(f"Checkpoint not found: {checkpoint_id}")
+            return False
+            
+        try:
+            # Load checkpoint data
+            checkpoint_data = torch.load(checkpoint_path)
+            
+            # Restore metadata
+            self.current_position = checkpoint_data["current_position"]
+            self.token_metadata = checkpoint_data["token_metadata"]
+            self.sequence_boundaries = checkpoint_data["sequence_boundaries"]
+            
+            if "stats" in checkpoint_data:
+                self.stats = checkpoint_data["stats"]
+                
+            # tokens will be loaded on demand from offload
+            
+            logger.info(f"Restored memory checkpoint: {checkpoint_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restore checkpoint: {e}")
+            return False
+            
+    def get_memory_usage_stats(self) -> Dict[str, Any]:
+        """Get memory usage statistics"""
+        # Count tokens in each tier
+        tier_counts = {tier.name: len(tokens) for tier, tokens in self.memory_tiers.items()}
+        
+        # Add offloaded count
+        tier_counts["OFFLOADED"] = sum(1 for meta in self.token_metadata.values() if meta.offloaded)
+        
+        # Overall numbers
+        total_tokens = len(self.token_metadata)
+        resident_tokens = sum(len(tokens) for tokens in self.memory_tiers.values())
+        
+        return {
+            "total_tokens": total_tokens,
+            "resident_tokens": resident_tokens,
+            "tier_counts": tier_counts,
+            "total_memory_mb": self.total_memory_usage / (1024 * 1024),
+            "memory_by_tier_mb": {tier.name: usage / (1024 * 1024) for tier, usage in self.memory_usage_by_tier.items()},
+            "current_position": self.current_position,
+            "performance_counters": self.stats
+        }
+        
+    def __str__(self) -> str:
+        """String representation with memory stats"""
+        stats = self.get_memory_usage_stats()
+        
+        result = "UltraScaleMemoryManager Stats:\n"
+        result += f"Total Tokens: {stats['total_tokens']:,}\n"
+        result += f"Resident Tokens: {stats['resident_tokens']:,}\n"
+        result += f"Current Position: {stats['current_position']:,}\n"
+        result += f"Total Memory: {stats['total_memory_mb']:.2f} MB\n"
+        result += "Token counts by tier:\n"
+        
+        for tier, count in stats['tier_counts'].items():
+            result += f"  {tier}: {count:,}\n"
+            
+        return result
+
+##############################################
+# Advanced Attention for 100M Token Contexts #
+##############################################
+
+class HierarchicalTransformerAttention(nn.Module):
+    """
+    Revolutionary attention mechanism for 100M+ token context windows using a hierarchical 
+    multi-resolution design with extreme sparsity, distributed block processing, and
+    specialized attention patterns for different context regions.
+    """
+    
+    def __init__(
         self,
-        hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        memory_id: Optional[str] = None,
-        use_retrieval_augmentation: Optional[bool] = None,
-        store_memories: bool = True,
-        return_dict: bool = True
-    ) -> Union[Tensor, Dict[str, Any]]:
-        """
-        Forward pass for the advanced memory system
+        dim: int,
+        heads: int = 8,
+        dim_head: Optional[int] = None,
+        max_seq_len: int = 100 * 1000 * 1000,  # 100M tokens
+        causal: bool = True,
+        dropout: float = 0.0,
         
-        Args:
-            hidden_states: Input hidden states
-            attention_mask: Optional attention mask
-            memory_id: Optional memory ID for retrieval/storage
-            use_retrieval_augmentation: Whether to use retrieval augmentation
-            store_memories: Whether to store memories
-            return_dict: Whether to return a dictionary of outputs
-            
-        Returns:
-            Output tensor or dictionary
-        """
-        batch_size, seq_len, _ = hidden_states.shape
+        # Hierarchical attention windows
+        focus_window: int = 128,           # Ultra-high precision window
+        active_window: int = 1024,         # Active high-precision window
+        mid_window: int = 8192,            # Mid-precision window
+        long_window: int = 65536,          # Low-precision long-range window
+        global_tokens: int = 1024,         # Number of global tokens
         
-        # Apply hardware adaptation if enabled
-        if self.hardware_aware and self.hardware_adapter is not None:
-            _, hw_params = self.hardware_adapter(hidden_states)
-            current_precision = hw_params['precision']
-            current_sparsity = hw_params['sparsity']
-        else:
-            current_precision = 32
-            current_sparsity = 0.0
-            
-        # Normalize input
-        hidden_states = self.norm_input(hidden_states)
+        # Attention mechanisms
+        recurrent_memory: bool = True,     # Use recurrent memory mechanisms
+        multi_hop: bool = True,            # Use multi-hop attention
+        num_hops: int = 3,                 # Number of hops for multi-hop attention
+        relative_pos: bool = True,         # Use relative position encoding
+        rotary_pos: bool = True,           # Use rotary position encoding
         
-        # Apply retrieval augmentation if enabled
-        use_ra = use_retrieval_augmentation if use_retrieval_augmentation is not None else self.enable_retrieval_augmentation
+        # Efficiency options
+        block_size: int = 1024,            # Block size for chunked processing
+        sliding_window_stride: int = 256,  # Stride for sliding windows
+        memory_efficient: bool = True,     # Use memory-efficient attention
+        use_flash_attention: bool = True,  # Use flash attention if available
+        precision: str = 'auto',           # 'auto', 'fp32', 'fp16', 'bf16'
         
-        if use_ra and self.retrieval_memory is not None:
-            # Use retrieval-augmented memory
-            hidden_states = self.retrieval_memory(
-                hidden_states,
-                store_memories=store_memories
+        # Memory integration
+        memory_manager: Optional[UltraScaleMemoryManager] = None,
+        use_memory_manager: bool = True,    # Whether to use the memory manager
+        
+        # Advanced features
+        group_size: int = 1,               # Number of heads per group for grouped attention
+        use_linear_bias: bool = False,     # Use bias in linear projections
+        scale_factor: float = 1.0,         # Scaling factor for attention
+        layer_idx: int = 0,                # Layer index for position-dependent settings
+        has_kv_cache: bool = True,         # Whether to use KV caching
+        use_triton: bool = True,           # Use Triton kernels when available
+        use_xpos: bool = True,             # Use x-positional encoding
+        dynamic_scaling: bool = True       # Scale attention dynamically based on sequence length
+    ):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.layer_idx = layer_idx
+        self.causal = causal
+        self.max_seq_len = max_seq_len
+        
+        # Hierarchical window sizes
+        self.focus_window = focus_window
+        self.active_window = active_window
+        self.mid_window = mid_window
+        self.long_window = long_window
+        self.global_tokens = global_tokens
+        
+        # Attention options
+        self.recurrent_memory = recurrent_memory
+        self.multi_hop = multi_hop
+        self.num_hops = num_hops
+        self.relative_pos = relative_pos
+        self.rotary_pos = rotary_pos
+        
+        # Efficiency options
+        self.block_size = block_size
+        self.sliding_window_stride = sliding_window_stride
+        self.memory_efficient = memory_efficient
+        self.use_flash_attention = use_flash_attention
+        self.precision = precision
+        
+        # Memory integration
+        self.memory_manager = memory_manager
+        self.use_memory_manager = use_memory_manager
+        
+        # Advanced features
+        self.group_size = group_size
+        self.use_linear_bias = use_linear_bias
+        self.scale_factor = scale_factor
+        self.has_kv_cache = has_kv_cache
+        self.use_triton = use_triton and HAS_TRITON
+        self.use_xpos = use_xpos
+        self.dynamic_scaling = dynamic_scaling
+        
+        # Set dimension per head
+        self.dim_head = dim_head or (dim // heads)
+        inner_dim = self.dim_head * heads
+        
+        # Linear projections
+        self.to_q = nn.Linear(dim, inner_dim, bias=use_linear_bias)
+        self.to_k = nn.Linear(dim, inner_dim, bias=use_linear_bias)
+        self.to_v = nn.Linear(dim, inner_dim, bias=use_linear_bias)
+        self.to_out = nn.Linear(inner_dim, dim, bias=use_linear_bias)
+        
+        # Dropouts
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        
+        # Positional encoding
+        if rotary_pos:
+            # Enhanced Rotary embeddings for ultra-long contexts
+            self.rotary_emb = EnhancedRotaryEmbedding(
+                dim=self.dim_head, 
+                max_seq_len=max_seq_len,
+                base=10000,
+                use_xpos=use_xpos
             )
             
-        # Project query, key, value
-        queries = self.to_q(hidden_states)
-        keys = self.to_k(hidden_states)
-        values = self.to_v(hidden_states)
+        if relative_pos:
+            # Relative positional bias
+            self.rel_pos_bias = RelativePositionalBias(
+                max_distance=long_window,
+                n_heads=heads
+            )
+            
+        # For recurrent memory
+        if recurrent_memory:
+            # Recurrent state for capturing ultra-long dependencies
+            self.init_recurrent_state()
+            
+        # Check for Flash Attention
+        self.has_flash_attn = False
+        if use_flash_attention:
+            try:
+                import flash_attn
+                self.has_flash_attn = True
+            except ImportError:
+                logger.warning("flash_attn package not found, falling back to standard attention")
+                
+        # For hierarchical attention tracking
+        self.global_token_indices = None
+        self.attention_stats = {
+            "focus_tokens_retrieved": 0,
+            "active_tokens_retrieved": 0,
+            "mid_tokens_retrieved": 0,
+            "long_tokens_retrieved": 0,
+            "global_tokens_retrieved": 0,
+            "total_tokens_retrieved": 0
+        }
+            
+    def init_recurrent_state(self):
+        """Initialize recurrent state for long-range memory"""
+        # Learned initial state
+        self.recurrent_init = nn.Parameter(torch.zeros(1, self.heads, 1, self.dim_head))
         
-        # Apply hierarchical attention
-        attn_output = self.hierarchical_attention(
-            hidden_states,
-            mask=attention_mask
+        # State compression and expansion
+        self.compress_state = nn.Sequential(
+            nn.Linear(self.dim_head, self.dim_head // 4),
+            nn.LayerNorm(self.dim_head // 4),
+            nn.GELU()
         )
         
-        # Apply memory model
-        memory_output = self.memory_model(hidden_states)
+        self.expand_state = nn.Sequential(
+            nn.Linear(self.dim_head // 4, self.dim_head),
+            nn.LayerNorm(self.dim_head)
+        )
         
-        # Combine attention and memory outputs
-        output = hidden_states + attn_output + memory_output
+        # Current recurrent state (will grow during usage)
+        self.register_buffer('recurrent_state', None, persistent=False)
         
-        # Final normalization
-        output = self.norm_output(output)
+    def reset_recurrent_state(self, batch_size=1):
+        """Reset recurrent state"""
+        self.recurrent_state = self.recurrent_init.expand(batch_size, -1, -1, -1).clone()
         
-        # Store memories if requested
-        if store_memories:
-            memory_id = self.store_memories(
-                output,
-                attention_mask,
-                memory_id
+    def update_recurrent_state(self, k: Tensor, v: Tensor, attention_scores: Optional[Tensor] = None):
+        """Update recurrent state with new information"""
+        if self.recurrent_state is None:
+            batch_size = k.size(0)
+            self.reset_recurrent_state(batch_size)
+            
+        # Compress and extract the most salient information
+        if attention_scores is not None:
+            # Weight by attention scores
+            k_weighted = torch.matmul(attention_scores.transpose(-2, -1), k)
+            v_weighted = torch.matmul(attention_scores.transpose(-2, -1), v)
+            
+            # Average weighted values
+            k_avg = k_weighted.mean(dim=2, keepdim=True)
+            v_avg = v_weighted.mean(dim=2, keepdim=True)
+        else:
+            # Simple average if no attention scores
+            k_avg = k.mean(dim=2, keepdim=True)
+            v_avg = v.mean(dim=2, keepdim=True)
+            
+        # Compress state
+        k_compressed = self.compress_state(k_avg)
+        v_compressed = self.compress_state(v_avg)
+        
+        # Compute weighted mean with existing state
+        state_compressed = self.compress_state(self.recurrent_state)
+        
+        # Update compressed state with exponential moving average
+        alpha = 0.9  # Weight for previous state
+        state_compressed = alpha * state_compressed + (1 - alpha) * (k_compressed + v_compressed) / 2
+        
+        # Expand back to full dimension
+        self.recurrent_state = self.expand_state(state_compressed)
+        
+    def get_hierarchical_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Create a hierarchical attention mask with multi-scale attention patterns
+        for different regions of the context
+        """
+        # Initialize full attention mask
+        mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
+        
+        # Generate focus window mask (strongest attention around immediate context)
+        focus_size = min(seq_len, self.focus_window)
+        for i in range(seq_len):
+            start = max(0, i - focus_size // 2)
+            end = min(seq_len, i + focus_size // 2 + 1)
+            mask[i, start:end] = True
+            
+        # Generate active window mask
+        active_size = min(seq_len, self.active_window)
+        for i in range(seq_len):
+            start = max(0, i - active_size // 2)
+            end = min(seq_len, i + active_size // 2 + 1)
+            mask[i, start:end] = True
+            
+        # Generate mid-range mask with strided pattern (attend to every n-th token)
+        mid_size = min(seq_len, self.mid_window)
+        stride = max(1, mid_size // 100)  # Stride for mid window
+        for i in range(seq_len):
+            start = max(0, i - mid_size)
+            end = min(seq_len, i + 1)  # Causal: only look back
+            # Strided pattern
+            indices = torch.arange(start, end, stride, device=device)
+            mask[i, indices] = True
+            
+        # Add global tokens (attend to first tokens and evenly spaced ones)
+        num_global = min(seq_len, self.global_tokens)
+        
+        # Always attend to first N tokens
+        prefix_size = min(32, num_global // 4)
+        mask[:, :prefix_size] = True
+        
+        # Add evenly spaced global tokens throughout the sequence
+        if seq_len > prefix_size:
+            stride = (seq_len - prefix_size) // (num_global - prefix_size)
+            if stride > 0:  # Ensure stride is at least 1
+                global_indices = torch.arange(prefix_size, seq_len, stride, device=device)
+                global_indices = global_indices[:num_global-prefix_size]
+                mask[:, global_indices] = True
+                
+        # Apply causal constraint if needed
+        if self.causal:
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+            mask = mask & causal_mask
+            
+        return mask
+    
+    def _apply_xpos(self, q: Tensor, k: Tensor, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Apply XPos (extended positional encoding) to queries and keys"""
+        if not self.use_xpos or not hasattr(self, 'rotary_emb'):
+            return q, k
+            
+        # Delegate to rotary embedding's xpos implementation
+        return self.rotary_emb.apply_xpos(q, k, seq_len)
+    
+    def _apply_rotary(self, q: Tensor, k: Tensor, positions: torch.Tensor) -> Tuple[Tensor, Tensor]:
+        """Apply rotary positional embeddings to queries and keys"""
+        if not self.rotary_pos or not hasattr(self, 'rotary_emb'):
+            return q, k
+            
+        # Apply rotary embeddings
+        q_rot = self.rotary_emb(q, positions)
+        k_rot = self.rotary_emb(k, positions)
+        
+        return q_rot, k_rot
+    
+    def _scaled_dot_product(
+        self, 
+        q: Tensor, 
+        k: Tensor, 
+        v: Tensor,
+        mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Compute scaled dot-product attention
+        
+        Args:
+            q: Query tensor of shape [batch, heads, seq_len, dim_head]
+            k: Key tensor of shape [batch, heads, seq_len, dim_head]
+            v: Value tensor of shape [batch, heads, seq_len, dim_head]
+            mask: Optional attention mask of shape [seq_len, seq_len]
+            dropout_p: Dropout probability
+            
+        Returns:
+            Tuple of (output, attention weights)
+        """
+        # Scale query
+        scale_factor = self.scale_factor / math.sqrt(self.dim_head)
+        if self.dynamic_scaling:
+            # Further reduce scale for very long sequences to avoid numerical instability
+            seq_scaling = 1.0 / math.sqrt(1 + math.log(max(1, k.size(2)) / 1024))
+            scale_factor *= seq_scaling
+            
+        q = q * scale_factor
+        
+        # Compute attention scores
+        attn_scores = torch.matmul(q, k.transpose(-1, -2))
+        
+        # Apply relative positional bias if enabled
+        if self.relative_pos and hasattr(self, 'rel_pos_bias'):
+            rel_pos_bias = self.rel_pos_bias(q.size(2), k.size(2))
+            attn_scores = attn_scores + rel_pos_bias
+        
+        # Apply mask if provided
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -torch.finfo(attn_scores.dtype).max)
+        
+        # Apply softmax
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # Apply dropout
+        if dropout_p > 0.0:
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+        
+        # Apply attention to values
+        output = torch.matmul(attn_weights, v)
+        
+        return output, attn_weights
+    
+    def _chunk_attention(
+        self, 
+        q: Tensor, 
+        k: Tensor, 
+        v: Tensor,
+        mask: Optional[Tensor] = None,
+        chunk_size: Optional[int] = None
+    ) -> Tensor:
+        """
+        Process attention in chunks to save memory
+        
+        Args:
+            q: Query tensor of shape [batch, heads, seq_len, dim_head]
+            k: Key tensor of shape [batch, heads, seq_len, dim_head]
+            v: Value tensor of shape [batch, heads, seq_len, dim_head]
+            mask: Optional attention mask
+            chunk_size: Size of chunks to process
+            
+        Returns:
+            Output tensor of shape [batch, heads, seq_len, dim_head]
+        """
+        batch_size, heads, seq_len, dim_head = q.shape
+        
+        # Use provided chunk size or default
+        chunk_size = chunk_size or self.block_size
+        
+        # Adjust chunk size based on sequence length
+        if seq_len > 131072:  # 128K tokens
+            chunk_size = min(chunk_size, 1024)  # Smaller chunks for very long sequences
+        elif seq_len > 32768:  # 32K tokens
+            chunk_size = min(chunk_size, 2048)  # Medium chunks for long sequences
+        else:
+            chunk_size = min(chunk_size, 4096)  # Larger chunks for shorter sequences
+            
+        # Ensure chunk size is reasonable
+        chunk_size = min(chunk_size, seq_len)
+        
+        # Initialize output
+        outputs = []
+        
+        # Process queries in chunks
+        for chunk_idx in range(0, seq_len, chunk_size):
+            # Define chunk boundaries
+            chunk_end = min(chunk_idx + chunk_size, seq_len)
+            chunk_len = chunk_end - chunk_idx
+            
+            # Extract chunk of queries
+            q_chunk = q[:, :, chunk_idx:chunk_end]
+            
+            # Compute causal attention mask for this chunk if needed
+            if self.causal:
+                # Create chunk-specific causal mask
+                if mask is not None:
+                    # Use provided mask and apply causality
+                    chunk_mask = mask[chunk_idx:chunk_end, :seq_len]
+                    if chunk_mask.dim() == 2:
+                        chunk_mask = chunk_mask.unsqueeze(0).unsqueeze(0)
+                else:
+                    # Create causal mask from scratch
+                    causal_mask = torch.ones(chunk_len, seq_len, device=q.device, dtype=torch.bool)
+                    
+                    # Apply causality - each position in chunk can only attend to previous positions
+                    for i in range(chunk_len):
+                        pos = chunk_idx + i
+                        causal_mask[i, pos+1:] = False
+                        
+                    chunk_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                # Just use provided mask for this chunk
+                if mask is not None:
+                    chunk_mask = mask[chunk_idx:chunk_end, :seq_len].unsqueeze(0).unsqueeze(0)
+                else:
+                    chunk_mask = None
+            
+            # Compute attention
+            chunk_output, _ = self._scaled_dot_product(
+                q_chunk, k, v, 
+                mask=chunk_mask.squeeze(0).squeeze(0) if chunk_mask is not None else None,
+                dropout_p=self.attn_dropout.p
             )
+            outputs.append(chunk_output)
             
-        # Run maintenance on memory manager
-        if self.step_counter % 100 == 0:  # Every 100 steps
-            self.memory_manager.run_maintenance()
+        # Concatenate all chunks
+        return torch.cat(outputs, dim=2)
+    
+    def _multi_hop_attention(
+        self, 
+        q: Tensor, 
+        k: Tensor, 
+        v: Tensor,
+        mask: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Apply multi-hop attention for better long-range dependency modeling
+        
+        Args:
+            q: Query tensor of shape [batch, heads, seq_len, dim_head]
+            k: Key tensor of shape [batch, heads, seq_len, dim_head]
+            v: Value tensor of shape [batch, heads, seq_len, dim_head]
+            mask: Optional attention mask
             
-        # Prefetch memories for next steps if enabled
-        if self.enable_prefetching:
-            prefetched = self.prefetch_memories(output)
+        Returns:
+            Tuple of (output, attention weights)
+        """
+        # Initial attention
+        x, attn_weights = self._scaled_dot_product(q, k, v, mask, self.attn_dropout.p)
+        
+        # For additional hops
+        for _ in range(self.num_hops - 1):
+            # Use output of previous hop as query
+            q = x
             
-        # Return appropriate output
-        if return_dict:
-            return {
-                "hidden_states": output,
-                "memory_id": memory_id,
-                "attention_output": attn_output,
-                "memory_output": memory_output,
-                "quantization": {
-                    "precision": current_precision,
-                    "sparsity": current_sparsity
-                }
-            }
+            # Apply another hop of attention
+            x, hop_attn = self._scaled_dot_product(q, k, v, mask, self.attn_dropout.p)
+            
+            # Update attention weights (additive accumulation)
+            attn_weights = attn_weights + hop_attn
+            
+        # Normalize accumulated attention weights
+        attn_weights = attn_weights / self.num_hops
+        
+        return x, attn_weights
+    
+    def _hierarchical_attention(
+        self, 
+        q: Tensor, 
+        k: Tensor, 
+        v: Tensor,
+        mask: Optional[Tensor] = None
+    ) -> Tensor:
+        """
+        Apply hierarchical attention with multi-scale processing
+        
+        Args:
+            q: Query tensor of shape [batch, heads, seq_len, dim_head]
+            k: Key tensor of shape [batch, heads, seq_len, dim_head]
+            v: Value tensor of shape [batch, heads, seq_len, dim_head]
+            mask: Optional attention mask
+            
+        Returns:
+            Output tensor of shape [batch, heads, seq_len, dim_head]
+        """
+        batch_size, heads, seq_len, dim_head = q.shape
+        
+        # Reset stats
+        self.attention_stats = {
+            "focus_tokens_retrieved": 0,
+            "active_tokens_retrieved": 0,
+            "mid_tokens_retrieved": 0,
+            "long_tokens_retrieved": 0,
+            "global_tokens_retrieved": 0,
+            "total_tokens_retrieved": 0
+        }
+        
+        # For very short sequences, just use standard attention
+        if seq_len <= self.active_window:
+            output, _ = self._scaled_dot_product(q, k, v, mask, self.attn_dropout.p)
+            self.attention_stats["focus_tokens_retrieved"] = seq_len
+            self.attention_stats["total_tokens_retrieved"] = seq_len
+            return output
+        
+        # Generate hierarchical attention if no mask provided
+        if mask is None:
+            mask = self.get_hierarchical_mask(seq_len, q.device)
+        
+        # Process in chunks based on hierarchical mask
+        output = torch.zeros_like(q)
+        
+        # 1. Process focus window for each position (highest precision)
+        focus_size = min(seq_len, self.focus_window)
+        
+        for i in range(0, seq_len, self.block_size):
+            # Process in blocks for efficiency
+            end_idx = min(i + self.block_size, seq_len)
+            block_len = end_idx - i
+            
+            for j in range(block_len):
+                pos = i + j
+                
+                # Define focus window around current position
+                start = max(0, pos - focus_size // 2)
+                end = min(seq_len, pos + focus_size // 2 + 1)
+                
+                # Apply causal constraint
+                if self.causal:
+                    end = min(end, pos + 1)
+                
+                # Get tokens in focus window
+                k_focus = k[:, :, start:end]
+                v_focus = v[:, :, start:end]
+                
+                # Create position-specific mask
+                pos_mask = torch.zeros(1, end-start, device=q.device, dtype=torch.bool)
+                pos_mask[0, :] = True
+                
+                # Apply attention for this position
+                q_pos = q[:, :, pos:pos+1]  # Shape: [batch, heads, 1, dim_head]
+                
+                # Note: for single query position, scaled dot product simplifies
+                attn_scores = torch.matmul(q_pos, k_focus.transpose(-1, -2))
+                attn_scores = attn_scores * (dim_head ** -0.5 * self.scale_factor)
+                
+                # Apply mask
+                attn_scores = attn_scores.masked_fill(~pos_mask.unsqueeze(0).unsqueeze(0), 
+                                                      -torch.finfo(attn_scores.dtype).max)
+                
+                # Apply softmax
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                attn_weights = self.attn_dropout(attn_weights)
+                
+                # Apply attention
+                output[:, :, pos:pos+1] = torch.matmul(attn_weights, v_focus)
+                
+                # Update stats
+                self.attention_stats["focus_tokens_retrieved"] += end - start
+                
+        # 2. Apply active window attention (already covered by focus window)
+        # 3. Apply mid-range attention (strided)
+        if seq_len > self.active_window:
+            mid_size = min(seq_len, self.mid_window)
+            stride = max(1, mid_size // 100)  # Stride for mid window
+            
+            # Identify mid-range tokens
+            mid_range_indices = []
+            for i in range(0, seq_len, stride):
+                if i >= self.active_window:  # Only tokens beyond active window
+                    mid_range_indices.append(i)
+            
+            # Only proceed if there are mid-range tokens
+            if mid_range_indices:
+                # Get mid-range keys and values
+                k_mid = k[:, :, mid_range_indices]
+                v_mid = v[:, :, mid_range_indices]
+                
+                # Apply attention for all queries
+                attn_scores = torch.matmul(q, k_mid.transpose(-1, -2)) 
+                attn_scores = attn_scores * (dim_head ** -0.5 * self.scale_factor)
+                
+                # Apply softmax
+                attn_weights = F.softmax(attn_scores, dim=-1) 
+                attn_weights = self.attn_dropout(attn_weights)
+                
+                # Apply attention with a weighting factor (less weight than focus)
+                mid_output = torch.matmul(attn_weights, v_mid) * 0.5
+                
+                # Add to main output
+                output = output + mid_output
+                
+                # Update stats
+                self.attention_stats["mid_tokens_retrieved"] += len(mid_range_indices)
+                
+        # 4. Apply global tokens attention
+        if self.global_tokens > 0:
+            num_global = min(seq_len, self.global_tokens)
+            
+            # Identify global tokens: first tokens and uniformly spaced ones
+            prefix_size = min(32, num_global // 4)
+            prefix_indices = list(range(prefix_size))
+            
+            # Add evenly spaced tokens
+            if seq_len > prefix_size:
+                stride = (seq_len - prefix_size) // (num_global - prefix_size)
+                if stride > 0:
+                    strided_indices = list(range(prefix_size, seq_len, stride))[:num_global-prefix_size]
+                    global_indices = prefix_indices + strided_indices
+                else:
+                    global_indices = prefix_indices
+            else:
+                global_indices = prefix_indices
+                
+            # Store for visualization/debugging
+            self.global_token_indices = global_indices
+            
+            # Get global keys and values
+            k_global = k[:, :, global_indices]
+            v_global = v[:, :, global_indices]
+            
+            # Apply attention for all queries
+            attn_scores = torch.matmul(q, k_global.transpose(-1, -2))
+            attn_scores = attn_scores * (dim_head ** -0.5 * self.scale_factor)
+            
+            # Apply softmax
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_weights = self.attn_dropout(attn_weights)
+            
+            # Apply attention with a weighting factor (global context influence)
+            global_output = torch.matmul(attn_weights, v_global) * 0.2
+            
+            # Add to main output
+            output = output + global_output
+            
+            # Update stats
+            self.attention_stats["global_tokens_retrieved"] += len(global_indices)
+            
+        # 5. Add recurrent state if enabled
+        if self.recurrent_memory and self.recurrent_state is not None:
+            # Apply attention between queries and recurrent state
+            attn_scores = torch.matmul(q, self.recurrent_state.transpose(-1, -2))
+            attn_scores = attn_scores * (dim_head ** -0.5 * self.scale_factor)
+            
+            # Apply softmax
+            attn_weights = F.softmax(attn_scores, dim=-1) 
+            attn_weights = self.attn_dropout(attn_weights)
+            
+            # Apply attention with a weighting factor (recurrent memory influence)
+            recurrent_output = torch.matmul(attn_weights, self.recurrent_state) * 0.1
+            
+            # Add to main output
+            output = output + recurrent_output
+            
+        # Update total tokens retrieved
+        self.attention_stats["total_tokens_retrieved"] = (
+            self.attention_stats["focus_tokens_retrieved"] +
+            self.attention_stats["active_tokens_retrieved"] +
+            self.attention_stats["mid_tokens_retrieved"] +
+            self.attention_stats["long_tokens_retrieved"] +
+            self.attention_stats["global_tokens_retrieved"]
+        )
+        
+        return output
+    
+    def forward(
+        self,
+        x: Tensor,
+        memory: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        positions: Optional[Tensor] = None,
+        use_kv_cache: bool = False,
+        kv_cache: Optional[Dict[str, Tensor]] = None,
+        attn_mode: str = 'hierarchical',  # 'standard', 'chunk', 'multi_hop', 'hierarchical'
+        return_attention: bool = False
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Forward pass for hierarchical transformer attention
+        
+        Args:
+            x: Input tensor of shape [batch, seq_len, dim]
+            memory: Optional memory tensor to attend to
+            mask: Optional attention mask
+            positions: Optional position indices
+            use_kv_cache: Whether to use KV cache
+            kv_cache: Optional KV cache dict
+            attn_mode: Attention mode to use
+            return_attention: Whether to return attention weights
+            
+        Returns:
+            Output tensor or tuple of (output, attention)
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Generate position indices if not provided
+        if positions is None:
+            positions = torch.arange(seq_len, device=x.device)
+            
+        # Initialize or get KV cache
+        k_cache, v_cache = None, None
+        if use_kv_cache and kv_cache is not None:
+            k_cache = kv_cache.get('k', None)
+            v_cache = kv_cache.get('v', None)
+            
+        # Project inputs to queries, keys, values
+        q = self.to_q(x)
+        
+        # Handle memory for cross-attention
+        if memory is not None:
+            # Cross-attention case
+            k = self.to_k(memory)
+            v = self.to_v(memory)
+        else:
+            # Self-attention case
+            k = self.to_k(x)
+            v = self.to_v(x)
+            
+        # Update KV cache if using
+        if use_kv_cache:
+            if k_cache is not None:
+                k = torch.cat([k_cache, k], dim=1)
+            if v_cache is not None:
+                v = torch.cat([v_cache, v], dim=1)
+                
+            # Store updated KV cache
+            if kv_cache is not None:
+                kv_cache['k'] = k
+                kv_cache['v'] = v
+            
+        # Reshape to [batch, heads, seq_len, dim_head]
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.heads)
+        
+        # Apply positional encodings
+        if self.rotary_pos:
+            q, k = self._apply_rotary(q, k, positions)
+            
+        if self.use_xpos:
+            q, k = self._apply_xpos(q, k, seq_len)
+            
+        # Choose attention implementation based on mode and sequence length
+        attention = None
+        
+        if self.has_flash_attn and x.is_cuda and seq_len <= 4096:
+            # Use Flash Attention if available and sequence is not too long
+            try:
+                import flash_attn
+                from flash_attn.flash_attention import FlashAttention
+                
+                flash_attn_func = FlashAttention(softmax_scale=1.0/math.sqrt(self.dim_head))
+                q_4d = q.transpose(1, 2)  # [b, n, h, d]
+                k_4d = k.transpose(1, 2)  # [b, n, h, d]
+                v_4d = v.transpose(1, 2)  # [b, n, h, d]
+                
+                output = flash_attn_func(q_4d, k_4d, v_4d, causal=self.causal)[0]
+                output = output.transpose(1, 2)  # back to [b, h, n, d]
+            except Exception as e:
+                logger.warning(f"Flash attention failed: {e}, falling back to standard attention")
+                output, attention = self._scaled_dot_product(q, k, v, mask, self.attn_dropout.p)
+        elif attn_mode == 'standard' or seq_len <= 1024:
+            # Standard attention for short sequences
+            output, attention = self._scaled_dot_product(q, k, v, mask, self.attn_dropout.p)
+        elif attn_mode == 'chunk' or seq_len <= 16384:
+            # Chunked attention for medium sequences
+            output = self._chunk_attention(q, k, v, mask)
+        elif attn_mode == 'multi_hop' and self.multi_hop:
+            # Multi-hop attention
+            output, attention = self._multi_hop_attention(q, k, v, mask)
+        else:
+            # Hierarchical attention for very long sequences
+            output = self._hierarchical_attention(q, k, v, mask)
+            
+        # Update recurrent state if enabled
+        if self.recurrent_memory and memory is None:  # Only for self-attention
+            self.update_recurrent_state(k, v, attention if attention is not None else None)
+            
+        # Reshape output
+        output = rearrange(output, 'b h n d -> b n (h d)')
+        
+        # Final projection and dropout
+        output = self.to_out(output)
+        output = self.resid_dropout(output)
+        
+        if return_attention and attention is not None:
+            return output, attention
         else:
             return output
 
+class EnhancedRotaryEmbedding(nn.Module):
+    """
+    Enhanced rotary positional embeddings optimized for 100M+ token contexts,
+    with distance-aware extended precision and hybrid log-linear scaling
+    """
+    
+    def __init__(
+        self, 
+        dim: int, 
+        max_seq_len: int = 100 * 1000 * 1000,
+        base: int = 10000,
+        use_xpos: bool = True,
+        scale_factor: float = 1.0,
+        use_hybrid_scaling: bool = True,
+        precision_scaling: bool = True
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        self.use_xpos = use_xpos
+        self.scale_factor = scale_factor
+        self.use_hybrid_scaling = use_hybrid_scaling
+        self.precision_scaling = precision_scaling
+        
+        # Adjust base for ultra-long contexts to avoid numerical issues
+        if max_seq_len > 65536:
+            # Hybrid log-linear scaling for ultra-long contexts
+            if use_hybrid_scaling:
+                scale_base = math.log(max_seq_len / 65536) / math.log(2)
+                self.hybrid_base = base * (1.0 + scale_base * 0.1)
+                self.hybrid_factor = 1.0 / (1.0 + scale_base * 0.1)
+            else:
+                # Traditional RoPE scaling
+                self.base = base * (max_seq_len / 65536) ** (self.dim / (self.dim - 2))
+                
+        # Create and cache the frequency tensors for efficiency
+        self.precompute_freqs()
+        
+        # For xpos scaling
+        if use_xpos:
+            # XPos scale and shift parameters
+            self.xpos_scale = nn.Parameter(torch.ones(1, 1, 1, dim//2))
+            self.xpos_shift = nn.Parameter(torch.zeros(1, 1, 1, dim//2))
+            
+    def precompute_freqs(self):
+        """Precompute the frequency tensors for efficiency using extended precision"""
+        # Create and register theta
+        theta = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        
+        # Scale theta for very long contexts if using hybrid scaling
+        if self.use_hybrid_scaling and hasattr(self, 'hybrid_factor'):
+            theta = theta * self.hybrid_factor
+            
+        # Create position sequence with extended precision
+        if self.max_seq_len > 1000000:
+            # For ultra-long sequences, use higher precision and segment-wise calculation
+            segment_size = 1000000
+            num_segments = (self.max_seq_len + segment_size - 1) // segment_size
+            
+            all_freqs = []
+            for i in range(num_segments):
+                start = i * segment_size
+                end = min((i + 1) * segment_size, self.max_seq_len)
+                seqs = torch.arange(start, end, dtype=torch.float64)  # Higher precision
+                
+                if self.use_hybrid_scaling and hasattr(self, 'hybrid_base'):
+                    # Apply log scaling for positions beyond certain threshold
+                    hybrid_base = self.hybrid_base
+                    # Linear scaling for initial positions
+                    mask_linear = (seqs < 65536).to(torch.float64)
+                    # Log scaling for later positions
+                    mask_log = 1 - mask_linear
+                    
+                    # Hybrid calculation
+                    scaled_seqs = seqs * mask_linear + (65536 + torch.log(seqs/65536 + 1) * 65536) * mask_log
+                    freqs = torch.outer(scaled_seqs, theta.to(torch.float64))
+                else:
+                    # Standard scaling
+                    freqs = torch.outer(seqs, theta.to(torch.float64))
+                
+                all_freqs.append(freqs)
+                
+            # Concatenate all segments
+            freqs = torch.cat(all_freqs, dim=0).float()
+        else:
+            # For shorter sequences, use standard precision
+            seqs = torch.arange(self.max_seq_len, dtype=torch.float32)
+            freqs = torch.outer(seqs, theta)
+        
+        # Register cos and sin values as buffers
+        self.register_buffer("cos_cached", torch.cos(freqs), persistent=False)
+        self.register_buffer("sin_cached", torch.sin(freqs), persistent=False)
+        
+    def apply_xpos(self, q: Tensor, k: Tensor, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Apply XPos (extended positional encoding) scaling"""
+        if not self.use_xpos:
+            return q, k
+            
+        # Create position indices
+        device = q.device
+        i = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+        
+        # Log position indices for better scaling with extremely long sequences
+        pos_log = torch.log1p(i) / math.log(self.max_seq_len)  # [1, seq_len]
+        pos_log = pos_log.unsqueeze(-1).unsqueeze(1)  # [1, 1, seq_len, 1]
+        
+        # Apply scaling factor to QK based on log position
+        scale = (self.xpos_scale * pos_log + self.xpos_shift).exp()
+        
+        # Reshape scale to match q and k shapes properly
+        # q: [batch, heads, seq_len, dim_head]
+        # Extract and scale real and imaginary parts separately
+        dim_half = q.shape[-1] // 2
+        
+        # Split into real and imaginary parts
+        q_real, q_imag = q[..., :dim_half], q[..., dim_half:]
+        k_real, k_imag = k[..., :dim_half], k[..., dim_half:]
+        
+        # Apply scaling
+        q_real = q_real * scale
+        q_imag = q_imag * scale
+        k_real = k_real * scale
+        k_imag = k_imag * scale
+        
+        # Recombine
+        q_out = torch.cat([q_real, q_imag], dim=-1)
+        k_out = torch.cat([k_real, k_imag], dim=-1)
+        
+        return q_out, k_out
+        
+    def forward(self, x: Tensor, positions: Tensor) -> Tensor:
+        """
+        Apply rotary embeddings to input tensor
+        
+        Args:
+            x: Input tensor of shape [batch, ..., seq_len, dim]
+            positions: Position indices of shape [seq_len]
+            
+        Returns:
+            Tensor with rotary embeddings applied
+        """
+        # Extract shapes
+        seq_len = positions.shape[0]
+        
+        # Only use positions within precomputed range
+        positions = positions % self.max_seq_len
+        
+        # Get the cos and sin values for these positions
+        cos = self.cos_cached[positions]
+        sin = self.sin_cached[positions]
+        
+        # Match dimensions
+        while cos.dim() < x.dim() - 1:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+            
+        # Add dummy dimension for dim
+        cos = cos.unsqueeze(-1)
+        sin = sin.unsqueeze(-1)
+        
+        # Expand to match x's dimensions exactly
+        for i in range(x.dim() - cos.dim()):
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+            
+        # Ensure the target shape matches exactly
+        target_shape = x.shape[:-1] + (cos.shape[-1],)
+        cos = cos.expand(target_shape)
+        sin = sin.expand(target_shape)
+        
+        # Adjust for precision issues in ultra-long contexts (>10M)
+        if self.precision_scaling and max(positions) > 10000000:
+            # Apply precision stabilization factors
+            precision_factor = 1.0 - torch.log1p(positions.float() / 10000000) * 0.1
+            precision_factor = precision_factor.to(x.device).unsqueeze(-1)
+            
+            # Expand to match shape
+            for _ in range(x.dim() - 2):
+                precision_factor = precision_factor.unsqueeze(0)
+                
+            # Apply to cos and sin (promotes numerical stability)
+            cos = cos * precision_factor
+            sin = sin * precision_factor
+        
+        # Half of the dimensions get rotated
+        x1, x2 = x.chunk(2, dim=-1)
+        
+        # Apply complex multiplication
+        # (a+bi)(cos+sin*i) = (a*cos-b*sin) + (a*sin+b*cos)i
+        result = torch.cat([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], dim=-1)
+        
+        return result
+
+class RelativePositionalBias(nn.Module):
+    """
+    Enhanced relative positional bias for ultra-long contexts,
+    with hierarchical multi-scale representation
+    """
+    
+    def __init__(
+        self,
+        max_distance: int = 128,
+        n_heads: int = 8,
+        num_buckets: int = 32,
+        max_log_distance: int = 100 * 1000 * 1000,
+        use_multi_scale: bool = True,
+        num_scales: int = 3,
+        scale_base: float = 10.0
+    ):
+        super().__init__()
+        self.max_distance = max_distance
+        self.n_heads = n_heads
+        self.num_buckets = num_buckets
+        self.max_log_distance = max_log_distance
+        self.use_multi_scale = use_multi_scale
+        self.num_scales = num_scales
+        self.scale_base = scale_base
+        
+        # Create relative position embedding tables
+        if use_multi_scale:
+            # Use multiple embedding tables for different distance scales
+            self.rel_pos_bias = nn.ModuleList([
+                nn.Embedding(num_buckets, n_heads) for _ in range(num_scales)
+            ])
+            
+            # Scale mixing weights
+            self.scale_weights = nn.Parameter(torch.ones(num_scales) / num_scales)
+        else:
+            # Traditional single-scale embedding
+            self.rel_pos_bias = nn.Embedding(num_buckets, n_heads)
+            
+    def _relative_position_bucket(
+        self, 
+        relative_position: Tensor, 
+        scale_idx: int = 0
+    ) -> Tensor:
+        """Convert relative positions to bucket indices with multi-scale support"""
+        # For multi-scale, adjust distance based on scale
+        if self.use_multi_scale and scale_idx > 0:
+            # Apply exponential scaling for higher scales
+            scale_factor = self.scale_base ** scale_idx
+            relative_position = torch.sign(relative_position) * (
+                torch.log(torch.abs(relative_position).float() + 1) / 
+                math.log(scale_factor)
+            ).to(relative_position.dtype)
+        
+        # Handle both bidirectional ([-max_distance, max_distance]) and unidirectional ([0, max_distance])
+        num_buckets = self.num_buckets
+        max_exact = self.max_distance // 2
+        is_small = torch.abs(relative_position) < max_exact
+        
+        # Use log-space buckets for longer distances
+        relative_position_if_large = max_exact + (
+            torch.log(torch.abs(relative_position).float() / max_exact) / 
+            math.log(self.max_log_distance / max_exact) * (num_buckets // 2)
+        ).to(torch.long)
+        
+        relative_position_if_large = torch.min(
+            relative_position_if_large,
+            torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+        
+        # Select bucket index based on distance
+        relative_buckets = torch.where(
+            is_small,
+            torch.abs(relative_position),
+            relative_position_if_large
+        )
+        
+        # For bidirectional attention, split buckets for positive and negative distances
+        relative_buckets = torch.where(
+            relative_position > 0,
+            relative_buckets + num_buckets // 2,
+            relative_buckets
+        )
+        
+        return relative_buckets
+        
+    def forward(self, query_len: int, key_len: int) -> Tensor:
+        """
+        Compute relative positional bias
+        
+        Args:
+            query_len: Length of query
+            key_len: Length of key
+            
+        Returns:
+            Relative positional bias of shape [1, heads, query_len, key_len]
+        """
+        device = self.rel_pos_bias[0].weight.device if self.use_multi_scale else self.rel_pos_bias.weight.device
+        
+        # Create position indices
+        q_pos = torch.arange(query_len, dtype=torch.long, device=device)
+        k_pos = torch.arange(key_len, dtype=torch.long, device=device)
+        
+        # Compute relative positions [query_len, key_len]
+        relative_position = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
+        
+        if self.use_multi_scale:
+            # Compute biases at multiple scales
+            all_biases = []
+            
+            for scale_idx in range(self.num_scales):
+                # Get buckets for this scale
+                rel_buckets = self._relative_position_bucket(relative_position, scale_idx)
+                # Get bias values
+                bias = self.rel_pos_bias[scale_idx](rel_buckets)  # [query_len, key_len, heads]
+                # Transpose to [heads, query_len, key_len]
+                bias = bias.permute(2, 0, 1)
+                all_biases.append(bias)
+                
+            # Mix scales with learned weights
+            scale_weights = F.softmax(self.scale_weights, dim=0)
+            
+            # Calculate weighted sum of biases
+            bias = torch.stack(all_biases, dim=0) * scale_weights.view(-1, 1, 1, 1)
+            bias = bias.sum(dim=0)
+        else:
+            # Traditional single-scale bias
+            rel_buckets = self._relative_position_bucket(relative_position)
+            bias = self.rel_pos_bias(rel_buckets)  # [query_len, key_len, heads]
+            bias = bias.permute(2, 0, 1)  # [heads, query_len, key_len]
+            
+        # Add batch dimension: [1, heads, query_len, key_len]
+        return bias.unsqueeze(0)
+
 ##############################################
-# Factory method for easy instantiation      #
+# UltraScaleTransformer for 100M Contexts   #
 ##############################################
 
-def create_advanced_memory(
-    dim: int,
-    deployment_type: str = 'standard',  # 'standard', 'ultra_context', 'memory_efficient', 'distributed', 'edge'
-    **kwargs
-) -> AdvancedEnterpriseNeuralMemory:
+class UltraScaleTransformerBlock(nn.Module):
     """
-    Factory method to create pre-configured advanced memory systems
+    Ultra-optimized transformer block for 100M+ token contexts
+    with specialized attention, efficient computation, and memory integration
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        layer_norm_eps: float = 1e-5,
+        norm_position: str = 'pre',  # 'pre' or 'post'
+        activation: nn.Module = nn.GELU(),
+        use_memory_manager: bool = True,
+        memory_manager: Optional[UltraScaleMemoryManager] = None,
+        max_seq_len: int = 100 * 1000 * 1000,  # 100M tokens
+        use_mega_attention: bool = True,
+        relative_pos: bool = True,
+        rotary_pos: bool = True,
+        use_xpos: bool = True,
+        layer_idx: int = 0,
+        block_sparse: bool = True,
+        enable_quantization: bool = True,
+        memory_efficient: bool = True,
+        use_flash_attention: bool = True,
+        use_checkpointing: bool = True,
+        gate_residual: bool = True,
+        use_parallel_attention: bool = True,
+        use_bias: bool = False,
+        sandwich_norm: bool = True,  # Extra normalization between attention and MLP
+        ffn_expansion_factor: float = 2.0,  # Additional expansion for certain FFN activations
+        window_size: int = 1024,
+        global_tokens: int = 1024,
+        adaptive_computation: bool = True
+    ):
+        super().__init__()
+        self.dim = dim
+        self.layer_idx = layer_idx
+        self.norm_position = norm_position
+        self.use_memory_manager = use_memory_manager
+        self.memory_manager = memory_manager
+        self.use_checkpointing = use_checkpointing and HAS_CHECKPOINTING
+        self.gate_residual = gate_residual
+        self.use_parallel_attention = use_parallel_attention
+        self.sandwich_norm = sandwich_norm
+        self.adaptive_computation = adaptive_computation
+        
+        # Normalization layers
+        self.norm1 = nn.LayerNorm(dim, eps=layer_norm_eps)
+        self.norm2 = nn.LayerNorm(dim, eps=layer_norm_eps)
+        
+        if sandwich_norm:
+            self.norm_sandwich = nn.LayerNorm(dim, eps=layer_norm_eps)
+            
+        # Residual gating for enhanced gradient flow
+        if gate_residual:
+            self.gate1 = nn.Parameter(torch.ones(1))
+            self.gate2 = nn.Parameter(torch.ones(1))
+        
+        # Attention mechanism
+        if use_mega_attention:
+            self.attention = HierarchicalTransformerAttention(
+                dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                max_seq_len=max_seq_len,
+                causal=True,
+                dropout=dropout,
+                focus_window=128,
+                active_window=window_size,
+                mid_window=window_size * 8,
+                long_window=window_size * 64,
+                global_tokens=global_tokens,
+                recurrent_memory=True,
+                multi_hop=True,
+                relative_pos=relative_pos,
+                rotary_pos=rotary_pos,
+                memory_efficient=memory_efficient,
+                use_flash_attention=use_flash_attention,
+                memory_manager=memory_manager,
+                use_memory_manager=use_memory_manager,
+                use_xpos=use_xpos,
+                layer_idx=layer_idx,
+                use_linear_bias=use_bias
+            )
+        else:
+            # Fallback to standard attention (not recommended for 100M+ tokens)
+            self.attention = nn.MultiheadAttention(
+                embed_dim=dim,
+                num_heads=heads,
+                dropout=dropout,
+                batch_first=True,
+                bias=use_bias
+            )
+            
+        # Determine FFN dimensions
+        mlp_dim = int(dim * mlp_ratio)
+        if activation.__class__.__name__ in ['SwiGLU', 'GeGLU', 'GEGLU', 'ReGLU']:
+            # These activations need more capacity for optimal performance
+            mlp_dim = int(mlp_dim * ffn_expansion_factor)
+            
+        # MLP block options
+        if block_sparse:
+            # Block-sparse MLP for high efficiency
+            self.mlp = BlockSparseFFN(
+                dim=dim,
+                hidden_dim=mlp_dim,
+                activation=activation,
+                dropout=dropout,
+                block_size=64,
+                sparsity=0.8,
+                quantize=enable_quantization,
+                use_bias=use_bias
+            )
+        else:
+            # Standard MLP
+            self.mlp = MLP(
+                dim=dim,
+                hidden_dim=mlp_dim,
+                activation=activation,
+                dropout=dropout,
+                use_bias=use_bias
+            )
+            
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # Adaptive computation components
+        if adaptive_computation:
+            self.compute_controller = nn.Sequential(
+                nn.Linear(dim, dim // 16),
+                nn.GELU(),
+                nn.Linear(dim // 16, 1),
+                nn.Sigmoid()
+            )
+            
+    def _checkpoint_forward(self, module, *inputs):
+        """Apply gradient checkpointing if enabled"""
+        if self.use_checkpointing and HAS_CHECKPOINTING and any(p.requires_grad for p in module.parameters()):
+            return checkpoint(module, *inputs)
+        else:
+            return module(*inputs)
+    
+    def forward(
+        self, 
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None
+    ) -> Tensor:
+        """
+        Forward pass for the transformer block
+        
+        Args:
+            x: Input tensor of shape [batch, seq_len, dim]
+            mask: Optional attention mask
+            memory: Optional memory tensor for cross-attention
+            
+        Returns:
+            Output tensor of shape [batch, seq_len, dim]
+        """
+        # Adaptive computation - skip layer if computation controller determines it's not needed
+        if self.adaptive_computation:
+            # Compute a representative embedding of the sequence
+            seq_embedding = x.mean(dim=1)  # [batch, dim]
+            compute_score = self.compute_controller(seq_embedding)
+            
+            # Skip computation if score is too low (threshold depends on layer depth)
+            skip_threshold = 0.1 + (0.4 * self.layer_idx / 10)  # Higher layers are more likely to be computed
+            if compute_score.mean() < skip_threshold and not self.training:
+                return x  # Skip this layer's computation
+                
+        # Choose parallel or sequential processing
+        if self.use_parallel_attention:
+            # Parallel attention + FFN (better throughput)
+            return self._forward_parallel(x, mask, memory)
+        else:
+            # Sequential attention -> FFN (better for very deep models)
+            return self._forward_sequential(x, mask, memory)
+    
+    def _forward_sequential(
+        self, 
+        x: Tensor, 
+        mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None
+    ) -> Tensor:
+        """Sequential processing (attention followed by FFN)"""
+        # Apply layer normalization based on position
+        if self.norm_position == 'pre':
+            # Pre-norm (better for training stability with deep models)
+            attn_input = self.norm1(x)
+            
+            # Apply attention
+            if isinstance(self.attention, HierarchicalTransformerAttention):
+                if self.use_checkpointing:
+                    attn_output = self._checkpoint_forward(self.attention, attn_input, memory, mask)
+                else:
+                    attn_output = self.attention(attn_input, memory=memory, mask=mask)
+            else:
+                # Standard PyTorch attention
+                attn_output, _ = self.attention(
+                    attn_input, attn_input, attn_input,
+                    key_padding_mask=mask.logical_not() if mask is not None else None,
+                    need_weights=False
+                )
+                
+            # Residual connection with optional gating
+            if self.gate_residual:
+                x = x + self.dropout(attn_output) * self.gate1
+            else:
+                x = x + self.dropout(attn_output)
+            
+            # Optional sandwich norm between attention and FFN
+            if self.sandwich_norm:
+                mlp_input = self.norm_sandwich(x)
+            else:
+                # Standard pre-norm for MLP
+                mlp_input = self.norm2(x)
+                
+            # Apply MLP with checkpointing if enabled
+            if self.use_checkpointing:
+                mlp_output = self._checkpoint_forward(self.mlp, mlp_input)
+            else:
+                mlp_output = self.mlp(mlp_input)
+            
+            # Residual connection with optional gating
+            if self.gate_residual:
+                output = x + self.dropout(mlp_output) * self.gate2
+            else:
+                output = x + self.dropout(mlp_output)
+        else:
+            # Post-norm (traditional transformer)
+            # Apply attention
+            if isinstance(self.attention, HierarchicalTransformerAttention):
+                if self.use_checkpointing:
+                    attn_output = self._checkpoint_forward(self.attention, x, memory, mask)
+                else:
+                    attn_output = self.attention(x, memory=memory, mask=mask)
+            else:
+                # Standard PyTorch attention
+                attn_output, _ = self.attention(
+                    x, x, x,
+                    key_padding_mask=mask.logical_not() if mask is not None else None,
+                    need_weights=False
+                )
+                
+            # Residual connection and norm
+            if self.gate_residual:
+                x = self.norm1(x + self.dropout(attn_output) * self.gate1)
+            else:
+                x = self.norm1(x + self.dropout(attn_output))
+            
+            # Apply MLP with checkpointing if enabled
+            if self.use_checkpointing:
+                mlp_output = self._checkpoint_forward(self.mlp, x)
+            else:
+                mlp_output = self.mlp(x)
+            
+            # Residual connection and norm
+            if self.gate_residual:
+                output = self.norm2(x + self.dropout(mlp_output) * self.gate2)
+            else:
+                output = self.norm2(x + self.dropout(mlp_output))
+            
+        return output
+    
+    def _forward_parallel(
+        self, 
+        x: Tensor, 
+        mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None
+    ) -> Tensor:
+        """Parallel processing (attention and FFN in parallel)"""
+        if self.norm_position == 'pre':
+            # Pre-norm (better for training stability with deep models)
+            normed_x = self.norm1(x)
+            
+            # Apply attention
+            if isinstance(self.attention, HierarchicalTransformerAttention):
+                if self.use_checkpointing:
+                    attn_output = self._checkpoint_forward(self.attention, normed_x, memory, mask)
+                else:
+                    attn_output = self.attention(normed_x, memory=memory, mask=mask)
+            else:
+                # Standard PyTorch attention
+                attn_output, _ = self.attention(
+                    normed_x, normed_x, normed_x,
+                    key_padding_mask=mask.logical_not() if mask is not None else None,
+                    need_weights=False
+                )
+            
+            # Apply MLP in parallel with checkpointing if enabled
+            if self.sandwich_norm:
+                normed_x2 = self.norm_sandwich(normed_x)
+            else:
+                normed_x2 = self.norm2(normed_x)
+                
+            if self.use_checkpointing:
+                mlp_output = self._checkpoint_forward(self.mlp, normed_x2)
+            else:
+                mlp_output = self.mlp(normed_x2)
+            
+            # Combine outputs with optional gating
+            if self.gate_residual:
+                output = x + self.dropout(attn_output) * self.gate1 + self.dropout(mlp_output) * self.gate2
+            else:
+                output = x + self.dropout(attn_output) + self.dropout(mlp_output)
+        else:
+            # Post-norm (traditional transformer)
+            # Apply attention
+            if isinstance(self.attention, HierarchicalTransformerAttention):
+                if self.use_checkpointing:
+                    attn_output = self._checkpoint_forward(self.attention, x, memory, mask)
+                else:
+                    attn_output = self.attention(x, memory=memory, mask=mask)
+            else:
+                # Standard PyTorch attention
+                attn_output, _ = self.attention(
+                    x, x, x,
+                    key_padding_mask=mask.logical_not() if mask is not None else None,
+                    need_weights=False
+                )
+                
+            # Apply MLP in parallel
+            if self.use_checkpointing:
+                mlp_output = self._checkpoint_forward(self.mlp, x)
+            else:
+                mlp_output = self.mlp(x)
+            
+            # Combine outputs with optional gating
+            if self.gate_residual:
+                combined = x + self.dropout(attn_output) * self.gate1 + self.dropout(mlp_output) * self.gate2
+            else:
+                combined = x + self.dropout(attn_output) + self.dropout(mlp_output)
+                
+            # Apply final norm
+            output = self.norm1(combined)
+            
+        return output
+
+class MLP(nn.Module):
+    """Standard MLP with optional SwiGLU/GeGLU activation"""
+    
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: Optional[int] = None,
+        out_dim: Optional[int] = None,
+        activation: nn.Module = nn.GELU(),
+        dropout: float = 0.0,
+        use_bias: bool = True
+    ):
+        super().__init__()
+        hidden_dim = hidden_dim or (dim * 4)
+        out_dim = out_dim or dim
+        
+        # Determine if using a gated activation like SwiGLU/GeGLU
+        self.is_gated = activation.__class__.__name__ in ['SwiGLU', 'GeGLU', 'GEGLU', 'ReGLU']
+        
+        if self.is_gated:
+            # For gated activations, we need two projections
+            self.fc1_gate = nn.Linear(dim, hidden_dim, bias=use_bias)
+            self.fc1_value = nn.Linear(dim, hidden_dim, bias=use_bias)
+            self.activation = activation
+            self.fc2 = nn.Linear(hidden_dim, out_dim, bias=use_bias)
+        else:
+            # Standard MLP
+            self.fc1 = nn.Linear(dim, hidden_dim, bias=use_bias)
+            self.activation = activation
+            self.fc2 = nn.Linear(hidden_dim, out_dim, bias=use_bias)
+            
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass"""
+        if self.is_gated:
+            # For gated activations
+            gate = self.fc1_gate(x)
+            value = self.fc1_value(x)
+            
+            # Apply activation with gating
+            if hasattr(self.activation, 'forward_gated'):
+                # For activations with dedicated gated implementation
+                x = self.activation.forward_gated(gate, value)
+            else:
+                # Manual gating
+                x = self.activation(gate) * value
+        else:
+            # Standard MLP
+            x = self.fc1(x)
+            x = self.activation(x)
+            
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        
+        return x
+
+class BlockSparseFFN(nn.Module):
+    """
+    Block-sparse feed-forward network with quantization for 
+    memory-efficient processing of mega-scale contexts
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: Optional[int] = None,
+        out_dim: Optional[int] = None,
+        activation: nn.Module = nn.GELU(),
+        dropout: float = 0.0,
+        block_size: int = 64,
+        sparsity: float = 0.8,
+        quantize: bool = True,
+        quantize_bits: int = 8,
+        use_bias: bool = False,
+        structured_sparsity: bool = True,
+        residual_in_fp32: bool = True,
+        two_stage: bool = True  # Use two-stage FFN for better accuracy
+    ):
+        super().__init__()
+        hidden_dim = hidden_dim or (dim * 4)
+        out_dim = out_dim or dim
+        
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.sparsity = sparsity
+        self.quantize = quantize
+        self.block_size = block_size
+        self.residual_in_fp32 = residual_in_fp32
+        self.two_stage = two_stage
+        
+        # Adjust hidden dimensions to be divisible by block size
+        self.hidden_dim = ((hidden_dim + block_size - 1) // block_size) * block_size
+        
+        # First stage - dense expansion with block sparsity
+        self.fc1 = BlockSparseLinear(
+            dim, self.hidden_dim,
+            bias=use_bias,
+            block_size=block_size,
+            sparsity=sparsity,
+            structured_sparsity=structured_sparsity,
+            enable_quantization=quantize,
+            quantization_bits=quantize_bits
+        )
+        
+        # Determine if using a gated activation
+        self.is_gated = activation.__class__.__name__ in ['SwiGLU', 'GeGLU', 'GEGLU', 'ReGLU']
+        
+        if self.is_gated:
+            # For gated activations, we need a second expansion
+            self.fc1_gate = BlockSparseLinear(
+                dim, self.hidden_dim,
+                bias=use_bias,
+                block_size=block_size,
+                sparsity=sparsity,
+                structured_sparsity=structured_sparsity,
+                enable_quantization=quantize,
+                quantization_bits=quantize_bits
+            )
+            
+        # Activation
+        self.activation = activation
+        
+        # Optional second stage for two-stage FFN
+        if self.two_stage:
+            mid_dim = self.hidden_dim // 2
+            self.fc_mid = BlockSparseLinear(
+                self.hidden_dim, mid_dim,
+                bias=use_bias,
+                block_size=block_size,
+                sparsity=sparsity / 2,  # Lower sparsity for middle layer
+                structured_sparsity=structured_sparsity,
+                enable_quantization=quantize,
+                quantization_bits=quantize_bits
+            )
+            self.mid_activation = activation
+            self.fc2 = BlockSparseLinear(
+                mid_dim, out_dim,
+                bias=use_bias,
+                block_size=block_size,
+                sparsity=sparsity,
+                structured_sparsity=structured_sparsity,
+                enable_quantization=quantize,
+                quantization_bits=quantize_bits
+            )
+        else:
+            # Standard one-stage FFN
+            self.fc2 = BlockSparseLinear(
+                self.hidden_dim, out_dim,
+                bias=use_bias,
+                block_size=block_size,
+                sparsity=sparsity,
+                structured_sparsity=structured_sparsity,
+                enable_quantization=quantize,
+                quantization_bits=quantize_bits
+            )
+            
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass with block sparsity and optional quantization"""
+        # Store input dtype for residual
+        input_type = x.dtype
+        
+        # For residual in fp32 (helps with stability)
+        if self.residual_in_fp32:
+            x_for_residual = x.float()
+        
+        # First projection
+        if self.is_gated:
+            # Gated path
+            gate = self.fc1_gate(x)
+            value = self.fc1(x)
+            
+            # Apply activation with gating
+            if hasattr(self.activation, 'forward_gated'):
+                # For activations with dedicated gated implementation
+                h = self.activation.forward_gated(gate, value)
+            else:
+                # Manual gating
+                h = self.activation(gate) * value
+        else:
+            # Standard path
+            h = self.fc1(x)
+            h = self.activation(h)
+            
+        h = self.dropout(h)
+        
+        # Two-stage processing if enabled
+        if self.two_stage:
+            h = self.fc_mid(h)
+            h = self.mid_activation(h)
+            h = self.dropout(h)
+            
+        # Final projection
+        h = self.fc2(h)
+        
+        # Restore original dtype if needed
+        if self.residual_in_fp32:
+            h = h.to(input_type)
+            
+        return h
+
+class UltraScaleTransformer(nn.Module):
+    """
+    Ultimate 100M+ context transformer with hierarchical memory architecture,
+    extreme efficiency optimizations, and hybrid token processing
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        depth: int = 24,
+        heads: int = 16,
+        dim_head: Optional[int] = None,
+        max_seq_len: int = 100 * 1000 * 1000,
+        vocab_size: Optional[int] = None,
+        max_memory_tokens: int = 100 * 1000 * 1000,
+        enable_memory_manager: bool = True,
+        token_retrieval_mode: str = 'auto',  # 'auto', 'exact', 'streaming', 'fixed'
+        memory_offload_path: str = "./ultra_memory_offload",
+        
+        # Architecture options
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        emb_dropout: float = 0.0,
+        layer_norm_eps: float = 1e-5,
+        use_rope: bool = True,
+        use_flash_attn: bool = True,
+        use_xpos: bool = True,
+        relative_pos: bool = True,
+        norm_position: str = 'pre',
+        final_norm: bool = True,
+        use_flash_ff: bool = True,
+        
+        # Model parallelism and efficiency
+        enable_checkpointing: bool = True,
+        activation: Union[str, nn.Module] = 'gelu',
+        use_bias: bool = False,
+        tie_emb_prj: bool = True,
+        block_sparse: bool = True,
+        enable_quantization: bool = True,
+        memory_efficient: bool = True,
+        enable_ema: bool = True,  # Use exponential moving average for weights
+        
+        # Advanced architecture options
+        dim_expansion_factor: float = 1.0,  # Expanding dimensions in later layers
+        decoupled_emb_dim: Optional[int] = None,  # Separate embedding dimension
+        sandwich_norm: bool = True,  # Extra norm between attention and FFN
+        memory_layers: Optional[List[int]] = None,  # Layers that use memory
+        adaptive_computation: bool = True,  # Adaptively skip layers
+        sparse_layers: Optional[List[int]] = None,  # Layers with extra sparsity
+        
+        # Memory configuration
+        memory_config: Optional[Dict[str, Any]] = None,
+        
+        # Device settings
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32
+    ):
+        super().__init__()
+        self.dim = dim
+        self.depth = depth
+        self.heads = heads
+        self.dim_head = dim_head or (dim // heads)
+        self.max_seq_len = max_seq_len
+        self.vocab_size = vocab_size
+        self.enable_memory_manager = enable_memory_manager
+        self.token_retrieval_mode = token_retrieval_mode
+        self.use_rope = use_rope
+        self.memory_efficient = memory_efficient
+        self.enable_ema = enable_ema
+        self.adaptive_computation = adaptive_computation
+        
+        # Set device
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.dtype = dtype
+        
+        # Initialize memory manager if enabled
+        if enable_memory_manager:
+            memory_config = memory_config or {}
+            self.memory_manager = UltraScaleMemoryManager(
+                model_dim=dim,
+                max_total_tokens=max_memory_tokens,
+                offload_path=memory_offload_path,
+                enable_tensor_compression=enable_quantization,
+                enable_semantic_compression=True,
+                token_pruning=True,
+                token_deduplication=True,
+                enable_checkpointing=True,
+                enable_vector_index=True,
+                device=self.device,
+                **memory_config
+            )
+        else:
+            self.memory_manager = None
+            
+        # Determine embedding dimension (can be decoupled from model dim)
+        self.emb_dim = decoupled_emb_dim or dim
+        
+        # Initialize token embedding
+        if vocab_size is not None:
+            self.token_emb = nn.Embedding(vocab_size, self.emb_dim)
+            
+            # Add projection if embedding dimension differs from model dimension
+            if self.emb_dim != dim:
+                self.emb_proj = nn.Identity()
+                
+        # Positional embedding options
+        if use_rope:
+            # Will be handled in attention layers
+            self.pos_emb = None
+        else:
+            # Use learned positional embeddings for layers without RoPE
+            self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, dim))
+            nn.init.normal_(self.pos_emb, std=0.02)
+            
+        # Dropout
+        self.emb_dropout = nn.Dropout(emb_dropout)
+        
+        # Convert activation string to module if needed
+        if isinstance(activation, str):
+            if activation == 'gelu':
+                activation = nn.GELU()
+            elif activation == 'swiglu':
+                activation = nn.SiLU()  # SwiGLU will be handled in FFN
+            elif activation == 'relu':
+                activation = nn.ReLU()
+            else:
+                logger.warning(f"Unknown activation: {activation}, using GELU")
+                activation = nn.GELU()
+                
+        # Set memory layers if not provided
+        if memory_layers is None:
+            # By default, use memory in 1/3 of layers
+            memory_layers = list(range(depth // 3, depth, depth // 3))
+            
+        # Set sparse layers if not provided
+        if sparse_layers is None:
+            # By default, increase sparsity in later layers
+            sparse_layers = list(range(depth // 2, depth))
+        
+        # Initialize transformer layers with progressive expansion
+        self.layers = nn.ModuleList([])
+        for i in range(depth):
+            # Apply dimension expansion in later layers if needed
+            if dim_expansion_factor > 1.0:
+                # Gradually increase dimension
+                layer_dim = dim if i < depth // 2 else int(dim * dim_expansion_factor)
+                
+                # Add projection for dimension change if needed
+                if i == depth // 2 and layer_dim != dim:
+                    self.layers.append(nn.Linear(dim, layer_dim, bias=use_bias))
+            else:
+                layer_dim = dim
+                
+            # Compute layer-specific configurations
+            use_memory = i in memory_layers
+            higher_sparsity = i in sparse_layers
+            sparsity_factor = 1.5 if higher_sparsity else 1.0  # Increase sparsity in some layers
+            
+            # Create transformer block
+            self.layers.append(UltraScaleTransformerBlock(
+                dim=layer_dim,
+                heads=heads,
+                dim_head=self.dim_head,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                layer_norm_eps=layer_norm_eps,
+                norm_position=norm_position,
+                activation=activation,
+                use_memory_manager=use_memory and enable_memory_manager,
+                memory_manager=self.memory_manager if use_memory else None,
+                max_seq_len=max_seq_len,
+                use_mega_attention=True,
+                relative_pos=relative_pos,
+                rotary_pos=use_rope,
+                use_xpos=use_xpos,
+                layer_idx=i,
+                block_sparse=block_sparse,
+                enable_quantization=enable_quantization,
+                memory_efficient=memory_efficient,
+                use_flash_attention=use_flash_attention,
+                use_checkpointing=enable_checkpointing,
+                sandwich_norm=sandwich_norm,
+                gate_residual=True,
+                use_parallel_attention=(i % 2 == 0),  # Alternate between parallel and sequential
+                use_bias=use_bias,
+                window_size=1024 + (i * 128),  # Gradually increase window size in later layers
+                global_tokens=256 + (i * 32),   # Gradually increase global tokens
+                adaptive_computation=adaptive_computation
+            ))
+            
+        # Final normalization
+        if final_norm:
+            self.norm_f = nn.LayerNorm(dim if dim_expansion_factor == 1.0 else layer_dim, eps=layer_norm_eps)
+        else:
+            self.norm_f = nn.Identity()
+            
+        # Final projection for language modeling
+        if vocab_size is not None:
+            if tie_emb_prj and self.emb_dim == dim:
+                # Tie embedding and projection weights
+                self.to_logits = lambda x: F.linear(x, self.token_emb.weight)
+            else:
+                # Separate projection layer
+                self.to_logits = nn.Linear(dim if dim_expansion_factor == 1.0 else layer_dim, 
+                                          vocab_size, bias=use_bias)
+                
+        # EMA setup if enabled
+        if enable_ema:
+            self.ema_params = {}
+            self.ema_decay = 0.999
+            
+        # Initialize parameters
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        """Initialize weights with scaled initialization"""
+        if isinstance(module, nn.Linear):
+            # Use scaled initialization for better gradient flow in deep models
+            nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(self.depth))
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+            
+    def update_ema(self):
+        """Update exponential moving average of weights"""
+        if not self.enable_ema:
+            return
+            
+        # Initialize EMA parameters on first call
+        if not self.ema_params:
+            for name, param in self.named_parameters():
+                if param.requires_grad:
+                    self.ema_params[name] = param.data.clone()
+                    
+        # Update EMA parameters
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                if param.requires_grad:
+                    self.ema_params[name].mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
+                    
+    def apply_ema(self):
+        """Apply EMA weights to model"""
+        if not self.enable_ema or not self.ema_params:
+            return
+            
+        # Store current parameters
+        current_params = {}
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                current_params[name] = param.data.clone()
+                
+        # Apply EMA parameters
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                if param.requires_grad and name in self.ema_params:
+                    param.data.copy_(self.ema_params[name])
+                    
+        return current_params
+        
+    def restore_params(self, current_params):
+        """Restore original parameters after using EMA weights"""
+        if not current_params:
+            return
+            
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                if param.requires_grad and name in current_params:
+                    param.data.copy_(current_params[name])
+    
+    @contextmanager
+    def ema_context(self):
+        """Context manager for temporarily using EMA weights"""
+        if not self.enable_ema:
+            yield
+            return
+            
+        current_params = self.apply_ema()
+        try:
+            yield
+        finally:
+            self.restore_params(current_params)
+            
+    def get_input_embeddings(self, token_ids: Tensor) -> Tensor:
+        """Get embeddings from token IDs"""
+        if not hasattr(self, 'token_emb'):
+            raise ValueError("Model does not have token embeddings")
+            
+        embeddings = self.token_emb(token_ids)
+        
+        # Project embeddings if needed
+        if self.emb_dim != self.dim:
+            embeddings = self.emb_proj(embeddings)
+            
+        return embeddings
+        
+    def get_token_indices(self, token_ids: Optional[Tensor] = None, input_embeds: Optional[Tensor] = None) -> Tensor:
+        """Get position indices for tokens"""
+        if token_ids is not None:
+            seq_len = token_ids.size(1)
+        elif input_embeds is not None:
+            seq_len = input_embeds.size(1)
+        else:
+            raise ValueError("Either token_ids or input_embeds must be provided")
+            
+        # Get device from inputs
+        device = token_ids.device if token_ids is not None else input_embeds.device
+        
+        # Create position indices
+        return torch.arange(seq_len, device=device)
+        
+    def forward(
+        self,
+        token_ids: Optional[Tensor] = None,
+        input_embeds: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+        past_key_values: Optional[Dict[int, Dict[str, Tensor]]] = None,
+        use_kv_cache: bool = False,
+        use_chunked_processing: bool = True,
+        chunk_size: int = 4096,
+        store_memory: bool = True,
+        return_dict: bool = True,
+        return_attention_stats: bool = False,
+        use_ema: bool = False,
+        token_memory_ids: Optional[List[int]] = None
+    ) -> Union[Tensor, Dict[str, Tensor]]:
+        """
+        Forward pass through the model
+        
+        Args:
+            token_ids: Optional tensor of token IDs [batch, seq_len]
+            input_embeds: Optional pre-computed embeddings [batch, seq_len, dim]
+            attention_mask: Optional attention mask [batch, seq_len]
+            position_ids: Optional position indices [batch, seq_len]
+            past_key_values: Optional cached KV for faster generation
+            use_kv_cache: Whether to use KV caching for generation
+            use_chunked_processing: Whether to process long sequences in chunks
+            chunk_size: Size of chunks for processing
+            store_memory: Whether to store token embeddings in memory manager
+            return_dict: Whether to return dict with additional info
+            return_attention_stats: Whether to return attention statistics
+            use_ema: Whether to use EMA weights for this forward pass
+            token_memory_ids: Optional list of token IDs for memory retrieval
+            
+        Returns:
+            Model output tensor or dict with additional information
+        """
+        # Use EMA weights if specified
+        if use_ema and self.enable_ema:
+            with self.ema_context():
+                return self._forward_impl(
+                    token_ids, input_embeds, attention_mask, position_ids,
+                    past_key_values, use_kv_cache, use_chunked_processing,
+                    chunk_size, store_memory, return_dict, return_attention_stats,
+                    token_memory_ids
+                )
+        else:
+            return self._forward_impl(
+                token_ids, input_embeds, attention_mask, position_ids,
+                past_key_values, use_kv_cache, use_chunked_processing,
+                chunk_size, store_memory, return_dict, return_attention_stats,
+                token_memory_ids
+            )
+    
+    def _forward_impl(
+        self,
+        token_ids: Optional[Tensor] = None,
+        input_embeds: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+        past_key_values: Optional[Dict[int, Dict[str, Tensor]]] = None,
+        use_kv_cache: bool = False,
+        use_chunked_processing: bool = True,
+        chunk_size: int = 4096,
+        store_memory: bool = True,
+        return_dict: bool = True,
+        return_attention_stats: bool = False,
+        token_memory_ids: Optional[List[int]] = None
+    ) -> Union[Tensor, Dict[str, Tensor]]:
+        """Internal implementation of forward pass"""
+        # Initialize KV cache if using
+        if use_kv_cache and past_key_values is None:
+            past_key_values = {}
+            
+        # Get embeddings
+        if input_embeds is None:
+            if token_ids is None:
+                raise ValueError("Either token_ids or input_embeds must be provided")
+                
+            # Get token embeddings
+            x = self.get_input_embeddings(token_ids)
+        else:
+            x = input_embeds
+            
+        # Get batch size and sequence length
+        batch_size, seq_len, _ = x.shape
+        
+        # Get position IDs if not provided
+        if position_ids is None:
+            position_ids = self.get_token_indices(token_ids, input_embeds)
+            
+        # Add positional embeddings if using learned positions
+        if self.pos_emb is not None:
+            max_pos = min(seq_len, self.max_seq_len)
+            x = x + self.pos_emb[:, :max_pos]
+            
+        # Apply embedding dropout
+        x = self.emb_dropout(x)
+        
+        # Process according to sequence length
+        if use_chunked_processing and seq_len > chunk_size:
+            # Process in chunks for very long sequences
+            x = self._chunked_forward(
+                x, attention_mask, position_ids, past_key_values,
+                use_kv_cache, chunk_size, store_memory, token_memory_ids
+            )
+        else:
+            # Store in memory manager if enabled
+            if self.enable_memory_manager and self.memory_manager is not None and store_memory:
+                importance = torch.ones(batch_size, seq_len, device=x.device) * 0.5
+                
+                for b in range(batch_size):
+                    self.memory_manager.add_tokens(
+                        token_embeddings=x[b],
+                        importance_scores=importance[b],
+                        token_ids=token_memory_ids
+                    )
+            
+            # Standard processing
+            attn_stats = []
+            
+            # Process through transformer layers
+            for i, layer in enumerate(self.layers):
+                # Skip linear dimension projection layers
+                if isinstance(layer, nn.Linear):
+                    x = layer(x)
+                    continue
+                    
+                # Process through transformer block
+                layer_past = past_key_values.get(i) if past_key_values else None
+                
+                x = layer(x, mask=attention_mask)
+                
+                # Collect attention statistics if requested
+                if return_attention_stats and hasattr(layer, 'attention') and hasattr(layer.attention, 'attention_stats'):
+                    attn_stats.append(layer.attention.attention_stats)
+                    
+        # Apply final normalization
+        x = self.norm_f(x)
+        
+        # Convert to logits if needed
+        if hasattr(self, 'to_logits'):
+            logits = self.to_logits(x)
+        else:
+            logits = None
+            
+        if return_dict:
+            outputs = {
+                'last_hidden_state': x,
+                'logits': logits
+            }
+            
+            if return_attention_stats:
+                outputs['attention_stats'] = attn_stats
+                
+            return outputs
+        else:
+            return logits if logits is not None else x
+    
+    def _chunked_forward(
+        self,
+        x: Tensor,
+        attention_mask: Optional[Tensor],
+        position_ids: Tensor,
+        past_key_values: Optional[Dict[int, Dict[str, Tensor]]],
+        use_kv_cache: bool,
+        chunk_size: int,
+        store_memory: bool,
+        token_memory_ids: Optional[List[int]]
+    ) -> Tensor:
+        """Process long sequences in chunks for memory efficiency"""
+        batch_size, seq_len, hidden_dim = x.shape
+        
+        # Determine optimal chunk size based on hardware
+        device_chunks = {
+            'cuda': min(8192, chunk_size),
+            'cpu': min(4096, chunk_size),
+            'mps': min(2048, chunk_size)
+        }
+        optimal_chunk_size = device_chunks.get(str(x.device.type), chunk_size)
+        
+        # Adjust for extremely long sequences
+        if seq_len > 1000000:  # 1M tokens
+            optimal_chunk_size = min(optimal_chunk_size, 1024)
+        elif seq_len > 100000:  # 100K tokens
+            optimal_chunk_size = min(optimal_chunk_size, 2048)
+            
+        # Use adjusted chunk size
+        chunk_size = optimal_chunk_size
+        
+        # Process in chunks
+        outputs = torch.zeros_like(x)
+        
+        for chunk_start in range(0, seq_len, chunk_size):
+            # Define chunk boundaries
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+            chunk_slice = slice(chunk_start, chunk_end)
+            
+            # Extract chunk
+            x_chunk = x[:, chunk_slice, :]
+            
+            # Extract corresponding attention mask if provided
+            if attention_mask is not None:
+                mask_chunk = attention_mask[:, chunk_slice]
+            else:
+                mask_chunk = None
+                
+            # Extract position IDs for this chunk
+            pos_chunk = position_ids[chunk_slice]
+            
+            # Store in memory manager if enabled
+            if self.enable_memory_manager and self.memory_manager is not None and store_memory:
+                importance = torch.ones(batch_size, chunk_end - chunk_start, device=x.device) * 0.5
+                
+                for b in range(batch_size):
+                    self.memory_manager.add_tokens(
+                        token_embeddings=x_chunk[b],
+                        importance_scores=importance[b],
+                        token_ids=token_memory_ids[chunk_start:chunk_end] if token_memory_ids else None
+                    )
+            
+            # Process chunk through transformer layers
+            for i, layer in enumerate(self.layers):
+                # Skip linear dimension projection layers
+                if isinstance(layer, nn.Linear):
+                    x_chunk = layer(x_chunk)
+                    continue
+                    
+                # Process through transformer block
+                layer_past = past_key_values.get(i) if past_key_values else None
+                
+                x_chunk = layer(x_chunk, mask=mask_chunk)
+                
+            # Store processed chunk
+            outputs[:, chunk_slice, :] = x_chunk
+            
+        return outputs
+        
+    def generate(
+        self,
+        token_ids: Tensor,
+        max_length: int = 100,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
+        do_sample: bool = True,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        use_kv_cache: bool = True,
+        use_ema: bool = False
+    ) -> Tensor:
+        """
+        Generate text using the model
+        
+        Args:
+            token_ids: Input token IDs [batch, seq_len]
+            max_length: Maximum generation length
+            temperature: Sampling temperature
+            top_k: Number of highest probability tokens to keep
+            top_p: Cumulative probability for nucleus sampling
+            repetition_penalty: Penalty for repeating tokens
+            do_sample: Whether to sample or use greedy decoding
+            pad_token_id: ID of pad token
+            eos_token_id: ID of EOS token
+            use_kv_cache: Whether to use KV caching for faster generation
+            use_ema: Whether to use EMA weights for generation
+            
+        Returns:
+            Generated token IDs [batch, max_length]
+        """
+        # Ensure the model is in eval mode
+        self.eval()
+        
+        # Use EMA weights if specified
+        if use_ema and self.enable_ema:
+            current_params = self.apply_ema()
+            
+        try:
+            batch_size = token_ids.shape[0]
+            
+            # Clone to avoid modifying the input
+            token_ids = token_ids.clone()
+            
+            # Initialize KV cache if using
+            past_key_values = {} if use_kv_cache else None
+            
+            # Track sequences that have finished
+            if eos_token_id is not None:
+                unfinished = torch.ones(batch_size, 1, device=token_ids.device, dtype=torch.bool)
+            
+            # Keep generating until max length
+            for _ in range(max_length - token_ids.shape[1]):
+                # Get position IDs
+                position_ids = torch.arange(token_ids.shape[1], device=token_ids.device).unsqueeze(0)
+                
+                # Forward pass
+                outputs = self.forward(
+                    token_ids=token_ids,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_kv_cache=use_kv_cache,
+                    return_dict=True
+                )
+                
+                # Get logits for next token prediction
+                next_token_logits = outputs['logits'][:, -1, :]
+                
+                # Apply temperature
+                next_token_logits = next_token_logits / max(temperature, 1e-7)
+                
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for batch_idx in range(batch_size):
+                        for prev_token in token_ids[batch_idx]:
+                            if prev_token.item() < next_token_logits.shape[-1]:
+                                next_token_logits[batch_idx, prev_token] /= repetition_penalty
+                
+                # Apply filtering
+                if do_sample:
+                    # Apply top-k filtering
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = -float('Inf')
+                        
+                    # Apply top-p (nucleus) filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        
+                        # Remove tokens with cumulative probability above the threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        
+                        # Shift the indices to the right to keep the first token above threshold
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                        next_token_logits[indices_to_remove] = -float('Inf')
+                        
+                    # Sample from the filtered distribution
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    # Greedy decoding
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                    
+                # Update tokens
+                token_ids = torch.cat([token_ids, next_token], dim=-1)
+                
+                # Check if EOS token has been generated
+                if eos_token_id is not None:
+                    unfinished = unfinished & (next_token != eos_token_id).bool()
+                    if not unfinished.any():
+                        break
+                        
+            # Apply padding if needed
+            if pad_token_id is not None:
+                # Replace EOS tokens with padding
+                if eos_token_id is not None:
+                    token_ids[token_ids == eos_token_id] = pad_token_id
+                    
+            return token_ids
+            
+        finally:
+            # Restore original weights if EMA was used
+            if use_ema and self.enable_ema:
+                self.restore_params(current_params)
+                
+    @torch.no_grad()
+    def embed_text(
+        self, 
+        token_ids: Tensor,
+        use_ema: bool = True,
+        normalize: bool = True,
+        pool_method: str = 'mean'  # 'mean', 'max', 'cls'
+    ) -> Tensor:
+        """
+        Generate text embeddings
+        
+        Args:
+            token_ids: Input token IDs [batch, seq_len]
+            use_ema: Whether to use EMA weights
+            normalize: Whether to normalize outputs
+            pool_method: How to pool sequence embeddings
+            
+        Returns:
+            Text embeddings [batch, dim]
+        """
+        # Set model to eval mode
+        self.eval()
+        
+        # Use EMA weights if specified
+        with self.ema_context() if use_ema and self.enable_ema else nullcontext():
+            # Forward pass
+            outputs = self.forward(
+                token_ids=token_ids,
+                return_dict=True
+            )
+            
+            hidden_states = outputs['last_hidden_state']
+            
+            # Pool embeddings
+            if pool_method == 'cls':
+                pooled = hidden_states[:, 0]
+            elif pool_method == 'max':
+                pooled = torch.max(hidden_states, dim=1)[0]
+            else:  # 'mean' is default
+                pooled = torch.mean(hidden_states, dim=1)
+                
+            # Normalize if requested
+            if normalize:
+                pooled = F.normalize(pooled, p=2, dim=-1)
+                
+            return pooled
+
+##############################################
+# Utility Functions and Factory Method       #
+##############################################
+
+def create_ultra_scale_transformer(
+    dim: int = 2048,
+    depth: int = 32,
+    heads: int = 32,
+    context_size: int = 100 * 1000 * 1000,  # 100M tokens
+    vocab_size: Optional[int] = None,
+    mode: str = 'balanced',  # 'balanced', 'performance', 'extreme', 'efficient', or 'custom'
+    memory_mode: str = 'auto',  # 'auto', 'standard', 'maximum', 'minimum'
+    **kwargs
+) -> UltraScaleTransformer:
+    """
+    Factory method to create a pre-configured UltraScaleTransformer
     
     Args:
-        dim: Feature dimension
-        deployment_type: Type of deployment scenario
+        dim: Model dimension
+        depth: Number of transformer layers
+        heads: Number of attention heads
+        context_size: Maximum context size in tokens
+        vocab_size: Optional vocabulary size
+        mode: Configuration mode
+        memory_mode: Memory configuration mode
         **kwargs: Additional configuration parameters
         
     Returns:
-        Configured AdvancedEnterpriseNeuralMemory instance
+        Configured UltraScaleTransformer instance
     """
-    config = {}
+    config = {
+        'dim': dim,
+        'depth': depth,
+        'heads': heads,
+        'max_seq_len': context_size,
+        'vocab_size': vocab_size
+    }
     
-    # Common configuration
-    config['dim'] = dim
+    # Apply memory configuration based on mode
+    memory_config = {}
     
-    # Apply configuration based on deployment type
-    if deployment_type == 'ultra_context':
-        # Optimized for extremely long context windows
+    if memory_mode == 'maximum':
+        memory_config = {
+            'token_pruning': False,  # Keep all tokens
+            'pruning_threshold': 0.01,  # Very low pruning threshold
+            'token_deduplication': True,
+            'enable_vector_index': True,
+            'vector_index_sample_rate': 0.2,  # Index more tokens
+            'enable_offloading': True
+        }
+    elif memory_mode == 'minimum':
+        memory_config = {
+            'token_pruning': True,
+            'pruning_threshold': 0.3,  # Higher pruning threshold
+            'token_deduplication': True,
+            'enable_vector_index': False,  # Disable vector indexing
+            'enable_offloading': False,  # Disable offloading
+            'max_memory_resident_tokens': context_size // 10  # Keep only 10% of tokens resident
+        }
+    elif memory_mode == 'standard':
+        memory_config = {
+            'token_pruning': True,
+            'pruning_threshold': 0.1,
+            'token_deduplication': True,
+            'enable_vector_index': True,
+            'vector_index_sample_rate': 0.1,
+            'enable_offloading': True
+        }
+    # 'auto' uses default settings
+    
+    # Apply configuration based on mode
+    if mode == 'performance':
+        # Optimized for inference speed
         config.update({
-            'max_seq_len': 102400,  # 100K tokens
-            'heads': min(16, max(4, dim // 64)),
-            'enable_retrieval_augmentation': True,
-            'retrieval_size': 32,
-            'enable_clustering': True,
-            'num_clusters': 32,
-            'enable_quantization': True,
-            'quantization_bits': 8,
-            'energy_efficiency_level': 2,
+            'dim_head': max(64, dim // heads),
+            'mlp_ratio': 3.5,
+            'dropout': 0.0,
+            'use_flash_attn': True,
+            'memory_efficient': True,
+            'enable_ema': True,
+            'use_bias': False,
+            'enable_checkpointing': False,  # Faster inference without checkpointing
+            'block_sparse': True,
+            'activation': 'swiglu',  # Faster activation
+            'use_rope': True,
+            'use_xpos': True,
+            'enable_quantization': True,  # Use quantization for speed
+            'sandbox_norm': False,  # Skip extra norm for speed
+            'token_retrieval_mode': 'streaming',  # Streaming mode for faster processing
+            'enable_memory_manager': True,
+            'memory_config': memory_config
         })
-    elif deployment_type == 'memory_efficient':
-        # Optimized for minimal memory footprint
+    elif mode == 'extreme':
+        # Maximally capable model for highest quality
         config.update({
-            'max_seq_len': 32768,  # 32K tokens
-            'heads': min(8, max(1, dim // 128)),
+            'dim_head': max(64, dim // heads),
+            'mlp_ratio': 4.5,
+            'dropout': 0.0 if depth < 48 else 0.1,  # Use dropout for very deep models
+            'use_flash_attn': True,
+            'use_rope': True,
+            'use_xpos': True,
+            'relative_pos': True,
+            'memory_efficient': True,
+            'enable_ema': True,
+            'use_bias': False,
+            'enable_checkpointing': True,
+            'block_sparse': True,
             'enable_quantization': True,
-            'quantization_bits': 4,
-            'enable_clustering': True,
-            'num_clusters': 8,
-            'energy_efficiency_level': 3,
-            'enable_prefetching': False,
+            'adaptive_computation': True,
+            'sandwich_norm': True,
+            'gate_residual': True,
+            'token_retrieval_mode': 'exact',
+            'enable_memory_manager': True,
+            'memory_config': memory_config
         })
-    elif deployment_type == 'distributed':
-        # Optimized for multi-device/multi-node deployment
+    elif mode == 'efficient':
+        # Balanced efficiency for lower resource usage
         config.update({
-            'enable_distributed': True,
-            'num_memory_shards': kwargs.get('num_shards', 8),
-            'enable_retrieval_augmentation': True,
-            'external_memory_size': 1000000,  # 1M items
-            'recovery_enabled': True,
-            'checkpoint_interval': 100,
-        })
-    elif deployment_type == 'edge':
-        # Optimized for edge devices with limited resources
-        config.update({
-            'max_seq_len': 4096,  # 4K tokens
-            'heads': min(4, max(1, dim // 128)),
+            'dim_head': max(64, dim // heads),
+            'mlp_ratio': 3.0,  # Smaller FFN
+            'dropout': 0.0,
+            'use_flash_attn': True,
+            'use_rope': True,
+            'use_xpos': True,
+            'relative_pos': False,  # Skip relative position bias
+            'memory_efficient': True,
+            'enable_ema': False,  # Skip EMA
+            'use_bias': False,
+            'enable_checkpointing': True,
+            'block_sparse': True,
             'enable_quantization': True,
-            'quantization_bits': 4,
-            'enable_clustering': False,
-            'enable_retrieval_augmentation': False,
-            'enable_prefetching': False,
-            'energy_efficiency_level': 3,
-            'hardware_aware': True,
+            'adaptive_computation': True,
+            'sandwich_norm': False,
+            'token_retrieval_mode': 'fixed',
+            'enable_memory_manager': True,
+            'memory_config': memory_config
         })
-    else:  # 'standard'
-        # Balanced configuration
+    else:  # 'balanced' or 'custom'
+        # Default balanced configuration
         config.update({
-            'max_seq_len': 32768,  # 32K tokens
-            'enable_retrieval_augmentation': True,
+            'dim_head': max(64, dim // heads),
+            'mlp_ratio': 4.0,
+            'dropout': 0.0,
+            'use_flash_attn': True,
+            'use_rope': True,
+            'use_xpos': True,
+            'relative_pos': True,
+            'memory_efficient': True,
+            'enable_ema': True,
+            'use_bias': False,
+            'enable_checkpointing': True,
+            'block_sparse': True,
             'enable_quantization': True,
-            'enable_clustering': True,
-            'enable_telemetry': True,
-            'hardware_aware': True,
-            'energy_efficiency_level': 1,
+            'sandwich_norm': True,
+            'gate_residual': True,
+            'token_retrieval_mode': 'auto',
+            'enable_memory_manager': True,
+            'memory_config': memory_config
         })
     
     # Override with any user-provided kwargs
     config.update(kwargs)
     
-    return AdvancedEnterpriseNeuralMemory(**config)
+    # Create the model
+    return UltraScaleTransformer(**config)
 
-# Example usage:
-# 
-# # Create memory system for ultra-long context
-# memory = create_advanced_memory(
-#     dim=768, 
-#     deployment_type='ultra_context',
-#     enable_telemetry=True
-# )
-# 
-# # Process a document with 50K tokens
-# outputs = memory(
-#     hidden_states=document_embeddings,
-#     attention_mask=document_mask,
-#     store_memories=True
-# )
-# 
-# # Later, retrieve memories related to a query
-# retrieved_context, memory_ids = memory.retrieve_memories(
-#     query_states=query_embeddings,
-#     retrieval_type='semantic',
-#     num_retrievals=5
-# )
+##############################################
+# Example Usage                             #
+##############################################
+
+def example_usage():
+    """Example of how to use the UltraScaleTransformer"""
+    # Create a model with 100M token context window
+    model = create_ultra_scale_transformer(
+        dim=2048,  # Model dimension
+        depth=32,  # Number of layers
+        heads=32,  # Number of attention heads
+        context_size=100_000_000,  # 100M token context
+        vocab_size=32000,  # Vocabulary size
+        mode='balanced'  # Configuration mode
+    )
+    
+    # Generate random input
+    batch_size = 1
+    seq_len = 1024
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    token_ids = torch.randint(0, 32000, (batch_size, seq_len), device=device)
+    
+    # Forward pass
+    outputs = model(token_ids=token_ids, return_dict=True)
+    
+    # Print output shape
+    print(f"Last hidden state shape: {outputs['last_hidden_state'].shape}")
+    print(f"Logits shape: {outputs['logits'].shape}")
+    
+    # Generate text
+    generated = model.generate(
+        token_ids=token_ids[:, :10],  # Use first 10 tokens as prompt
+        max_length=20,
+        temperature=0.7,
+        top_p=0.9
+    )
+    
+    print(f"Generated tokens shape: {generated.shape}")
+    
+    # Get embeddings
+    embeddings = model.embed_text(token_ids)
+    print(f"Embeddings shape: {embeddings.shape}")
+    
+    # Print memory manager stats
+    if model.memory_manager is not None:
+        print(model.memory_manager)
+
+if __name__ == "__main__":
+    example_usage() = nn.Linear(self.emb_dim, dim, bias=use_bias)
+            else:
+                self.emb_proj
