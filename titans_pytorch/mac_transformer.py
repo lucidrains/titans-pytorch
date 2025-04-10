@@ -138,20 +138,6 @@ def pad_and_segment_with_inverse(
 
     return seq, inverse
 
-# sampling related
-
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
-
-def gumbel_noise(t):
-    noise = torch.rand_like(t)
-    return -log(-log(noise))
-
-def gumbel_sample(t, temperature = 1.):
-    if temperature > 0.:
-        t = t / temperature + gumbel_noise(t)
-    return t.argmax(dim = -1, keepdim = True)
-
 # feedforward and attention
 
 class GEGLU(Module):
