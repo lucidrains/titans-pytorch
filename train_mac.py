@@ -76,6 +76,24 @@ def cycle(loader):
         for data in loader:
             yield data
 
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def min_p_filter(logits, min_p = 0.1):
+    probs = logits.softmax(dim = 1)
+    max_probs = probs.amax(dim = 1, keepdim = True)
+    limit = min_p * max_probs
+    return torch.where(probs < limit, float('-inf'), logits)
+
+def gumbel_noise(t):
+    noise = torch.rand_like(t)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1.):
+    if temperature > 0.:
+        t = t / temperature + gumbel_noise(t)
+    return t.argmax(dim = 1, keepdim = True)
+
 def decode_token(token):
     return str(chr(max(32, token)))
 
@@ -97,12 +115,12 @@ else:
 # instantiate memory-as-context transformer
 
 model = MemoryAsContextTransformer(
-    num_tokens = 256,
+    num_features = 256,
     dim = 384,
     depth = 8,
     segment_len = WINDOW_SIZE,
-    num_persist_mem_tokens = NUM_PERSIST_MEM,
-    num_longterm_mem_tokens = NUM_LONGTERM_MEM,
+    num_persist_mem_features = NUM_PERSIST_MEM,
+    num_longterm_mem_features = NUM_LONGTERM_MEM,
     neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_segment_len = NEURAL_MEM_SEGMENT_LEN,
     neural_memory_batch_size = NEURAL_MEM_BATCH_SIZE,
@@ -161,7 +179,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader), return_loss = True)
+        loss = model(nn.Embedding(next(train_loader)), return_loss = True)
         loss.backward()
 
     print(f'training loss: {loss.item()}')
@@ -173,7 +191,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader), return_loss = True)
+            loss = model(nn.Embedding(next(val_loader)), return_loss = True)
             print(f'validation loss: {loss.item()}')
 
     if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
@@ -182,6 +200,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         prime = decode_tokens(inp)
         print(f'%s \n\n %s', (prime, '*' * 100))
 
-        sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
+        y = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
+        sample = gumbel_sample(min_p_filter(torch.softmax(y[:,-1,:], dim=1)))
         output_str = decode_tokens(sample[0])
         print(output_str)
