@@ -222,9 +222,9 @@ def test_neural_mem_chaining_with_batch_size():
 
     assert torch.allclose(parallel_retrieved, parallel_part_retrieved, atol = 1e-5)
 
-@pytest.mark.parametrize('seq_len', (1023, 17))
-@pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
-@pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
+@pytest.mark.parametrize('seq_len', (1023, 17, 256))
+@pytest.mark.parametrize('num_persist_mem_features', (0, 16))
+@pytest.mark.parametrize('num_longterm_mem_features', (0, 16))
 @pytest.mark.parametrize('neural_mem_gate_attn_output', (False, True))
 @pytest.mark.parametrize('neural_mem_segment_len', (8, 16))
 @pytest.mark.parametrize('neural_mem_weight_residual', (False, True))
@@ -233,8 +233,8 @@ def test_neural_mem_chaining_with_batch_size():
 @pytest.mark.parametrize('neural_mem_momentum', (False, True))
 def test_mac(
     seq_len,
-    num_persist_mem_tokens,
-    num_longterm_mem_tokens,
+    num_persist_mem_features,
+    num_longterm_mem_features,
     neural_mem_gate_attn_output,
     neural_mem_segment_len,
     neural_mem_weight_residual,
@@ -243,11 +243,11 @@ def test_mac(
     neural_mem_momentum
 ):
     transformer = MemoryAsContextTransformer(
-        num_tokens = 256,
+        num_features = 256,
         dim = 16,
         depth = 2,
-        num_persist_mem_tokens = num_persist_mem_tokens,
-        num_longterm_mem_tokens = num_longterm_mem_tokens,
+        num_persist_mem_features = num_persist_mem_features,
+        num_longterm_mem_features = num_longterm_mem_features,
         segment_len = 128,
         neural_mem_gate_attn_output = neural_mem_gate_attn_output,
         neural_memory_segment_len = neural_mem_segment_len,
@@ -276,12 +276,12 @@ def test_mac_sampling(
     prompt_len
 ):
     transformer = MemoryAsContextTransformer(
-        num_tokens = 256,
+        num_features = 256,
         dim = 16,
         depth = 4,
         segment_len = 32,
-        num_persist_mem_tokens = 4,
-        num_longterm_mem_tokens = longterm_mems,
+        num_persist_mem_features = 4,
+        num_longterm_mem_features = longterm_mems,
         sliding_window_attn = sliding,
         neural_memory_layers = mem_layers,
         neural_mem_gate_attn_output = False
@@ -360,8 +360,8 @@ def test_flex(
     attn = SegmentedAttention(
         dim = 16,
         segment_len = 32,
-        num_persist_mem_tokens = 1,
-        num_longterm_mem_tokens = 1,
+        num_persist_mem_features = 1,
+        num_longterm_mem_features = 1,
         use_flex_attn = True,
         sliding = sliding
     ).cuda()
