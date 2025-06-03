@@ -164,6 +164,12 @@ def newtonschulz5(
     if t.ndim <= 3:
         return t
 
+    shape = t.shape
+    should_transpose = shape[2] > shape[-1]
+
+    if should_transpose:
+        t = t.transpose(-1, -2)
+
     t, inv_pack = pack_one_with_inverse(t, '* i j')
     t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
 
@@ -173,6 +179,9 @@ def newtonschulz5(
         A = t @ t.transpose(-1, -2)
         B = b * A + c * A @ A
         t = a * t + B @ t
+
+    if should_transpose:
+        t = t.transpose(-1, -2)
 
     return inv_pack(t)
 
