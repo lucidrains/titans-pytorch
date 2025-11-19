@@ -19,31 +19,32 @@ class ImplicitMLPAttention(Module):
     def __init__(
         self,
         dim,
-        dim_head = 64,
+        mlp_hiddens: tuple[int, ...],
+        *,
+        activation = nn.SiLU(),
         heads = 8,
-        implicit_mlp_hiddens: tuple[int, ...] = (),
-        implicit_mlp_activation = nn.SiLU(),
         prenorm = True
     ):
         super().__init__()
+        assert isinstance(mlp_hiddens, tuple) and len(mlp_hiddens) >= 2
+        dim_mlp_in, *_, dim_mlp_out = mlp_hiddens
+
         self.norm = nn.RMSNorm(dim) if prenorm else nn.Identity()
 
-        dim_inner = dim_head * heads
-        self.to_queries = nn.Linear(dim, dim_inner, bias = False)
+        dim_query_inner = dim_mlp_in * heads
+        self.to_queries = nn.Linear(dim, dim_query_inner, bias = False)
 
         # keys and values
 
-        self.rotary_embed = RotaryEmbedding(dim_head)
+        self.rotary_embed = RotaryEmbedding(min(mlp_hiddens)) # just use the minimum dimension, the rest is partially rotaried
 
         # each key value forms an implicit weight (memory) of (dim_key, dim_values)
         # chaining them would then be the implicit MLP from TTT / Titans
 
-        mlp_dims = (dim_head, *implicit_mlp_hiddens, dim_head)
-
         self.keys = ModuleList([])
         self.values = ModuleList([])
 
-        for dim_in, dim_out in zip(mlp_dims[:-1], mlp_dims[1:]):
+        for dim_in, dim_out in zip(mlp_hiddens[:-1], mlp_hiddens[1:]):
 
             dim_keys_inner = dim_in * heads
             dim_values_inner = dim_out * heads
@@ -54,12 +55,12 @@ class ImplicitMLPAttention(Module):
             self.keys.append(keys)
             self.values.append(values)
 
-        self.implicit_mlp_activation = implicit_mlp_activation
+        self.activation = activation
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-        self.to_out = nn.Linear(dim_inner, dim, bias = False)
+        self.to_out = nn.Linear(dim_mlp_out * heads, dim, bias = False)
 
     def forward(
         self,
@@ -70,14 +71,14 @@ class ImplicitMLPAttention(Module):
 
         tokens = self.norm(tokens)
 
-        q = self.to_queries(tokens)
+        queries = self.to_queries(tokens)
 
         keys = [fn(tokens) for fn in self.keys]
         values = [fn(tokens) for fn in self.values]
 
         # split heads for input as well as all keys, values that form the implicit weights
 
-        q, keys, values = tree_map(self.split_heads, (q, keys, values))
+        queries, keys, values = tree_map(self.split_heads, (queries, keys, values))
 
         # cache
 
@@ -96,7 +97,7 @@ class ImplicitMLPAttention(Module):
 
         # implicit memory mlp
 
-        out = q
+        out = queries
 
         for i, (key, value) in enumerate(zip(keys, values), start = 1):
             is_last = i == len(keys)
@@ -104,7 +105,7 @@ class ImplicitMLPAttention(Module):
             out = attend(out, key, value)
 
             if not is_last:
-                out = self.implicit_mlp_activation(out)
+                out = self.activation(out)
 
         # merge heads
 
@@ -118,9 +119,8 @@ if __name__ == '__main__':
 
     implicit_mlp_attn = ImplicitMLPAttention(
         512,
-        dim_head = 64,
-        implicit_mlp_hiddens = (128, 128),
-        implicit_mlp_activation = nn.ReLU()
+        (64, 128, 128, 64),
+        activation = nn.ReLU()
     )
 
     tokens = torch.randn(1, 1024, 512)
