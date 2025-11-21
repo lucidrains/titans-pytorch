@@ -25,7 +25,8 @@ class ImplicitMLPAttention(Module):
         *,
         activation = nn.SiLU(),
         heads = 8,
-        prenorm = True
+        prenorm = True,
+        keys_rmsnorm = True # https://openreview.net/forum?id=HkztQWZfl2
     ):
         super().__init__()
         assert isinstance(mlp_hiddens, tuple) and len(mlp_hiddens) >= 2
@@ -44,6 +45,8 @@ class ImplicitMLPAttention(Module):
         # chaining them would then be the implicit MLP from TTT / Titans
 
         self.keys = ModuleList([])
+        self.key_norms = ModuleList([])
+
         self.values = ModuleList([])
 
         for dim_in, dim_out in zip(mlp_hiddens[:-1], mlp_hiddens[1:]):
@@ -52,9 +55,13 @@ class ImplicitMLPAttention(Module):
             dim_values_inner = dim_out * heads
 
             keys = nn.Linear(dim, dim_keys_inner, bias = False)
+            key_norms = nn.RMSNorm(dim_in) if keys_rmsnorm else nn.Identity()
+
             values = nn.Linear(dim, dim_values_inner, bias = False)
 
             self.keys.append(keys)
+            self.key_norms.append(key_norms)
+
             self.values.append(values)
 
         self.activation = activation
@@ -81,6 +88,10 @@ class ImplicitMLPAttention(Module):
         # split heads for input as well as all keys, values that form the implicit weights
 
         queries, keys, values = tree_map(self.split_heads, (queries, keys, values))
+
+        # maybe norm all keys
+
+        keys = [norm(k) for norm, k in zip(self.key_norms, keys)]
 
         # cache
 
