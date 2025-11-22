@@ -146,7 +146,8 @@ class Transformer(Module):
 model = Transformer(
     num_tokens = 256,
     dim = 512,
-    depth = 6
+    depth = 6,
+    implicit_mlp_attn_hiddens = (64, 96, 64)
 ).cuda()
 
 # prepare enwik8 data
