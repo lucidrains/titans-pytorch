@@ -25,12 +25,13 @@ class ImplicitMLPAttention(Module):
         *,
         activation = nn.SiLU(),
         heads = 8,
+        talking_heads = True,
         prenorm = True,
         keys_rmsnorm = True # https://openreview.net/forum?id=HkztQWZfl2
     ):
         super().__init__()
         assert isinstance(mlp_hiddens, tuple) and len(mlp_hiddens) >= 2
-        dim_mlp_in, *_, dim_mlp_out = mlp_hiddens
+        dim_mlp_in, *dim_mlp_inner, dim_mlp_out = mlp_hiddens
 
         self.norm = nn.RMSNorm(dim) if prenorm else nn.Identity()
 
@@ -66,6 +67,16 @@ class ImplicitMLPAttention(Module):
 
         self.activation = activation
 
+        # talking head - Shazeer et al.
+
+        self.talking_heads = nn.Identity()
+
+        if talking_heads and len(dim_mlp_inner) > 0:
+            self.talking_heads = nn.Conv2d(heads, heads, 1, bias = False)
+            nn.init.dirac_(self.talking_heads.weight)
+
+        # split merging of heads
+
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
@@ -74,7 +85,8 @@ class ImplicitMLPAttention(Module):
     def forward(
         self,
         tokens,
-        cache = None
+        cache = None,
+        return_kv_cache = False
     ):
         batch, seq_len, device = *tokens.shape[:2], tokens.device
 
@@ -118,13 +130,18 @@ class ImplicitMLPAttention(Module):
             out = attend(out, key, value)
 
             if not is_last:
+                out = self.talking_heads(out)
                 out = self.activation(out)
 
         # merge heads
 
         out = self.merge_heads(out)
+        out = self.to_out(out)
 
-        return self.to_out(out), (keys, values)
+        if not return_kv_cache:
+            return out
+
+        return out, (keys, values)
 
 # 3 layers implicit MLP attention - 64 -> 128 -> 128 -> 64 w/ relu
 
