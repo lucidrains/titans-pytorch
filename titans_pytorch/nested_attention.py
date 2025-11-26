@@ -90,11 +90,11 @@ class NestedAttention(Module):
 
         nq, nk, nv = [attend(queries, key, value) for key, value in zip(keys, values)]
 
+        nk = self.nested_key_norm(nk)
+
         if exists(cache):
             nk = cat((cache_nested_keys, nk), dim = -2)
             nv = cat((cache_nested_values, nv), dim = -2)
-
-        nk = self.nested_key_norm(nk)
 
         out = attend(nq, nk, nv)
 
