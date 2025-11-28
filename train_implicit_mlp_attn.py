@@ -1,3 +1,11 @@
+# /// script
+# dependencies = [
+#     "accelerate",
+#     "titans-pytorch",
+#     "tqdm"
+# ]
+# ///
+
 import math
 import gzip
 import random
@@ -12,7 +20,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from einops import rearrange
+
 from titans_pytorch.implicit_mlp_attention import ImplicitMLPAttention
+from titans_pytorch.nested_attention import NestedAttention
+
+from accelerate import Accelerator
 
 # constants
 
@@ -70,6 +82,8 @@ class Transformer(Module):
         depth,
         heads = 8,
         implicit_mlp_attn_hiddens = (64, 96, 64),
+        use_nested_attn = False,
+        dim_head = 64,
         ff_expansion = 4.,
         attn_kwargs: dict = dict(),
     ):
@@ -79,12 +93,21 @@ class Transformer(Module):
         self.layers = ModuleList([])
 
         for _ in range(depth):
-            attn = ImplicitMLPAttention(
-                dim = dim,
-                mlp_hiddens = implicit_mlp_attn_hiddens,
-                heads = heads,
-                **attn_kwargs
-            )
+
+            if use_nested_attn:
+                attn = NestedAttention(
+                    dim = dim,
+                    dim_head = dim_head,
+                    heads = heads,
+                    **attn_kwargs
+                )
+            else:
+                attn = ImplicitMLPAttention(
+                    dim = dim,
+                    mlp_hiddens = implicit_mlp_attn_hiddens,
+                    heads = heads,
+                    **attn_kwargs
+                )
 
             ff = nn.Sequential(
                 nn.RMSNorm(dim),
@@ -147,8 +170,9 @@ model = Transformer(
     num_tokens = 256,
     dim = 512,
     depth = 6,
-    implicit_mlp_attn_hiddens = (64, 96, 64)
-).cuda()
+    implicit_mlp_attn_hiddens = (64, 96, 64),
+    use_nested_attn = True # test implicit mlp attn vs nested attn
+)
 
 # prepare enwik8 data
 
@@ -169,7 +193,7 @@ class TextSamplerDataset(Dataset):
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq
 
 train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
 val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
@@ -179,6 +203,14 @@ val_loader = DataLoader(val_dataset, batch_size = BATCH_SIZE)
 # optimizer
 
 optim = Adam(model.parameters(), lr = LEARNING_RATE)
+
+# accelerate
+
+accelerator = Accelerator()
+
+model, optim, train_loader, val_loader = accelerator.prepare(model, optim, train_loader, val_loader)
+
+# cycle
 
 train_loader = cycle(train_loader)
 val_loader = cycle(val_loader)
@@ -193,9 +225,9 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         loss = model(data, return_loss = True)
 
-        (loss / GRAD_ACCUM_EVERY).backward()
+        accelerator.backward(loss / GRAD_ACCUM_EVERY)
 
-    print(f"training loss: {loss.item():.3f}")
+    accelerator.print(f"training loss: {loss.item():.3f}")
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
 
@@ -208,16 +240,15 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
             valid_data = next(val_loader)
 
             loss = model(valid_data, return_loss = True)
-            print(f"validation loss: {loss.item():.3f}")
+            accelerator.print(f"validation loss: {loss.item():.3f}")
 
     if i % GENERATE_EVERY == 0:
         model.eval()
 
-        inp = random.choice(val_dataset)[:PRIME_LENGTH]
-        inp = inp.cuda()
+        inp = next(val_loader)[0, :PRIME_LENGTH]
 
         prime = decode_tokens(inp)
-        print(f"\n\n[prompt]: {prime}")
+        accelerator.print(f"\n\n[prompt]: {prime}")
 
         prompt = inp[None, ...]
 
@@ -225,4 +256,4 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         base_decode_output = decode_tokens(sampled[0])
 
-        print(f"\n[generated]: {base_decode_output}\n\n")
+        accelerator.print(f"\n[generated]: {base_decode_output}\n\n")

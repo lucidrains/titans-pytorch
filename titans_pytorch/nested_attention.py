@@ -52,7 +52,8 @@ class NestedAttention(Module):
     def forward(
         self,
         tokens,
-        cache = None
+        cache = None,
+        return_kv_cache = False
     ):
         batch, seq_len, device = *tokens.shape[:2], tokens.device
 
@@ -102,7 +103,12 @@ class NestedAttention(Module):
 
         out = self.merge_heads(out)
 
-        return self.to_out(out), ((keys, values), (nk, nv))
+        out = self.to_out(out)
+
+        if not return_kv_cache:
+            return out
+
+        return out, ((keys, values), (nk, nv))
 
 if __name__ == '__main__':
 
