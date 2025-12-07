@@ -35,6 +35,7 @@ dependencies = [
     "tensordict",
     "torch>=2.2",
     "tqdm",
+    "adam_atan2_pytorch",
     "x-transformers"
 ]
 
