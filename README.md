@@ -42,22 +42,22 @@ import torch
 from titans_pytorch import MemoryAsContextTransformer
 
 transformer = MemoryAsContextTransformer(
-    num_tokens = 256,
+    num_features = 256,             # features could be embedded tokens
     dim = 256,
     depth = 2,
     segment_len = 128,              # local attention window size
-    num_persist_mem_tokens = 4,
-    num_longterm_mem_tokens = 16,
+    num_persist_mem_features = 4,
+    num_longterm_mem_features = 16,
 )
 
-token_ids = torch.randint(0, 256, (1, 1023))
+features = torch.randn(1, 1023, 256) # (batch, time, features)
 
-loss = transformer(token_ids, return_loss = True) # (1, 1023, 256)
+loss = transformer(features, return_loss = True)
 loss.backward()
 
 # after much training
 
-sampled = transformer.sample(token_ids[:, :4], 512)
+sampled = transformer.sample(features[:, :4, :], 512)
 ```
 
 ## Experiments

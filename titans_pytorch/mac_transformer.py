@@ -138,29 +138,6 @@ def pad_and_segment_with_inverse(
 
     return seq, inverse
 
-# sampling related
-
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
-
-def gumbel_noise(t):
-    noise = torch.rand_like(t)
-    return -log(-log(noise))
-
-def gumbel_sample(t, temperature = 1.):
-    if temperature > 0.:
-        t = t / temperature + gumbel_noise(t)
-    return t.argmax(dim = -1, keepdim = True)
-
-# min_p
-# https://arxiv.org/abs/2407.01082
-
-def min_p_filter(logits, min_p = 0.1):
-    probs = logits.softmax(dim = -1)
-    max_probs = probs.amax(dim = -1, keepdim = True)
-    limit = min_p * max_probs
-    return torch.where(probs < limit, float('-inf'), logits)
-
 # feedforward and attention
 
 class GEGLU(Module):
@@ -183,8 +160,8 @@ class SegmentedAttention(Module):
         self,
         dim,
         segment_len,
-        num_persist_mem_tokens = 0,
-        num_longterm_mem_tokens = 0,
+        num_persist_mem_features = 0,
+        num_longterm_mem_features = 0,
         dim_head = 64,
         heads = 8,
         sliding = False,
@@ -211,9 +188,9 @@ class SegmentedAttention(Module):
         ) if accept_value_residual else None
 
         self.segment_len = segment_len
-        self.num_longterm_mem_tokens = num_longterm_mem_tokens
+        self.num_longterm_mem_features = num_longterm_mem_features
 
-        total_segment_len = segment_len + num_longterm_mem_tokens
+        total_segment_len = segment_len + num_longterm_mem_features
         self.total_segment_len = total_segment_len
 
         self.sliding = sliding # sliding window attn - doubt their non-sliding results being the best. local attention with overlapping windows is very strong
@@ -221,7 +198,7 @@ class SegmentedAttention(Module):
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-        self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_tokens, dim_head))
+        self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_features, dim_head))
 
         # flex attn related
 
@@ -229,22 +206,22 @@ class SegmentedAttention(Module):
         self.use_flex_attn = use_flex_attn
 
         self.segment_len = segment_len
-        self.num_persist_mem_tokens = num_persist_mem_tokens
+        self.num_persist_mem_features = num_persist_mem_features
 
     def forward_inference(
         self,
-        token,
+        feature,
         cache,
         value_residual = None,
         output_gating = None,
     ):
-        batch = token.shape[0]
+        batch = feature.shape[0]
 
         # attention
 
-        token = self.norm(token)
+        feature = self.norm(feature)
 
-        q, k, v = self.to_qkv(token).chunk(3, dim = -1)
+        q, k, v = self.to_qkv(feature).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))
 
         # value residual
@@ -252,7 +229,7 @@ class SegmentedAttention(Module):
         orig_v = v
 
         if exists(self.to_learned_v_mix):
-            mix = self.to_learned_v_mix(token)
+            mix = self.to_learned_v_mix(feature)
             v = v.lerp(value_residual, mix)
 
         # caching
@@ -341,7 +318,7 @@ class SegmentedAttention(Module):
         # prep flex attention
 
         if not exists(flex_attn_fn):
-            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding)
+            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_features, self.sliding)
 
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
@@ -378,8 +355,8 @@ class SegmentedAttention(Module):
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
 
-        segment_len, num_longterm_mem_tokens = self.segment_len, self.num_longterm_mem_tokens
-        total_segment_len = segment_len + num_longterm_mem_tokens
+        segment_len, num_longterm_mem_features = self.segment_len, self.num_longterm_mem_features
+        total_segment_len = segment_len + num_longterm_mem_features
 
         batch, seq_len = seq.shape[:2]
 
@@ -436,7 +413,7 @@ class SegmentedAttention(Module):
             k_idx = rearrange(k_idx, 'w j -> w 1 j')
 
             sliding_mask = (q_idx - k_idx) <= total_segment_len
-            sliding_mask = F.pad(sliding_mask, (self.num_persist_mem_tokens, 0), value = True)
+            sliding_mask = F.pad(sliding_mask, (self.num_persist_mem_features, 0), value = True)
 
             sliding_mask = repeat(sliding_mask, 'w i j -> (b w) 1 i j', b = batch)
             attend_kwargs.update(mask = sliding_mask)
@@ -473,15 +450,15 @@ class MemoryAsContextTransformer(Module):
     def __init__(
         self,
         *,
-        num_tokens,
+        num_features,
         dim,
         depth,
         segment_len,
         neural_memory_segment_len = None,
         neural_mem_gate_attn_output = False,
         neural_memory_add_value_residual = False,
-        num_longterm_mem_tokens = 0,
-        num_persist_mem_tokens = 0,
+        num_longterm_mem_features = 0,
+        num_persist_mem_features = 0,
         neural_memory_batch_size = None,
         neural_memory_qkv_receives_diff_views = False,
         dim_head = 64,
@@ -494,32 +471,27 @@ class MemoryAsContextTransformer(Module):
         use_flex_attn = False,
         sliding_window_attn = False,
         neural_mem_weight_residual = False,
-        token_emb: Module | None = None,
     ):
         super().__init__()
 
-        if not exists(token_emb):
-            token_emb = nn.Embedding(num_tokens, dim)
-
-        self.token_emb = token_emb
 
         # absolute positions
 
         self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
 
-        # long term mem tokens
+        # long term mem features
 
         self.segment_len = segment_len
 
-        self.num_longterm_mem_tokens = num_longterm_mem_tokens
-        has_longterm_mems = num_longterm_mem_tokens > 0
+        self.num_longterm_mem_features = num_longterm_mem_features
+        has_longterm_mems = num_longterm_mem_features > 0
 
-        self.longterm_mems = nn.Parameter(torch.randn(num_longterm_mem_tokens, dim) * 0.02)
+        self.longterm_mems = nn.Parameter(torch.randn(num_longterm_mem_features, dim) * 0.02)
 
         # maybe sliding window attn
 
         self.sliding_window_attn = sliding_window_attn
-        self.attn_window_size = segment_len + num_longterm_mem_tokens
+        self.attn_window_size = segment_len + num_longterm_mem_features
 
         # hyper connection
 
@@ -527,7 +499,7 @@ class MemoryAsContextTransformer(Module):
 
         self.layers = ModuleList([])
 
-        self.neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_tokens + segment_len)
+        self.neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_features + segment_len)
 
         layers = tuple(range(1, depth + 1))
 
@@ -552,8 +524,8 @@ class MemoryAsContextTransformer(Module):
                 segment_len = segment_len,
                 use_flex_attn = use_flex_attn,
                 accept_value_residual = not is_first,
-                num_longterm_mem_tokens = num_longterm_mem_tokens,
-                num_persist_mem_tokens = num_persist_mem_tokens,
+                num_longterm_mem_features = num_longterm_mem_features,
+                num_persist_mem_features = num_persist_mem_features,
                 sliding = sliding_window_attn
             )
 
@@ -600,8 +572,6 @@ class MemoryAsContextTransformer(Module):
 
         self.norm = nn.RMSNorm(dim)
 
-        self.to_logits = LinearNoBias(dim, num_tokens)
-
         # whether to gate the attention output with the retrieved memories
 
         self.gate_attn_output = neural_mem_gate_attn_output
@@ -615,7 +585,7 @@ class MemoryAsContextTransformer(Module):
         assert not (use_flex_attn and not exists(flex_attention)), 'you need to be on the latest pytorch with a cuda device available'
         self.use_flex_attn = use_flex_attn
 
-        self.num_persist_mem_tokens = num_persist_mem_tokens
+        self.num_persist_mem_features = num_persist_mem_features
 
     def seq_index_is_longterm(
         self,
@@ -630,7 +600,7 @@ class MemoryAsContextTransformer(Module):
     ):
         assert seq_len > 0
 
-        segment_len, num_mem = self.segment_len, self.num_longterm_mem_tokens
+        segment_len, num_mem = self.segment_len, self.num_longterm_mem_features
         return ((seq_len - 1) // segment_len) * num_mem + seq_len
 
     @torch.no_grad()
@@ -639,17 +609,14 @@ class MemoryAsContextTransformer(Module):
         prompt: Tensor,
         seq_len: int,
         temperature = 1.5,
-        filter_fn: Callable = min_p_filter,
-        filter_kwargs: dict = dict(
-            min_p = 0.1,
-        ),
         show_progress = True,
         use_cache = False
     ):
         was_training = self.training
         self.eval()
 
-        prompt_seq_len, out = prompt.shape[-1], prompt.clone()
+        prompt_seq_len, out = prompt.shape[1], prompt.clone()
+        print(out.shape)
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
         # cache for axial pos, attention, and neural memory
@@ -670,9 +637,9 @@ class MemoryAsContextTransformer(Module):
 
         with tqdm.tqdm(total = sample_num_times, disable = not show_progress) as pbar:
 
-            while out.shape[-1] < seq_len:
+            while out.shape[1] < seq_len:
 
-                logits, next_cache = self.forward(
+                y, next_cache = self.forward(
                     out,
                     disable_flex_attn = True,
                     cache = cache,
@@ -683,20 +650,16 @@ class MemoryAsContextTransformer(Module):
                 if use_cache:
                     cache = next_cache
 
-                if not exists(logits):
+                if not exists(y):
+                    print('y is None')
                     continue
 
-                logits = logits[:, -1]
-
-                logits = filter_fn(logits, **filter_kwargs)
-                sample = gumbel_sample(logits, temperature = temperature)
-
-                out = torch.cat((out, sample), dim = -1)
+                out = torch.cat((out, y), dim = 1)
                 pbar.update(1)
 
         self.train(was_training)
 
-        return out[..., prompt_seq_len:]
+        return out[:, prompt_seq_len:, :]
 
     def forward(
         self,
@@ -710,17 +673,13 @@ class MemoryAsContextTransformer(Module):
     ):
 
         if return_loss:
-            x, labels = x[:, :-1], x[:, 1:]
+            x, labels = x[:, :-1, :], x[:, 1:, :]
 
         # math
 
-        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
+        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_features, attn_window_size = x.shape[0], x.shape[1], self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_features, self.attn_window_size
 
         seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
-
-        # token embedding
-
-        x = self.token_emb(x)
 
         # intersperse longterm memory
 
@@ -731,9 +690,9 @@ class MemoryAsContextTransformer(Module):
 
         x = inverse_segment(x)
 
-        # splice out unneeded tokens from padding for longterm mems
+        # splice out unneeded features from padding for longterm mems
 
-        x = x[:, :seq_len_with_mem]
+        x = x[:, :seq_len_with_mem, :]
 
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
@@ -749,7 +708,7 @@ class MemoryAsContextTransformer(Module):
         flex_attn_fn = None
 
         if use_flex_attn:
-            block_mask = create_mac_block_mask(seq_len_with_mem, self.attn_window_size, self.num_persist_mem_tokens, self.sliding_window_attn)
+            block_mask = create_mac_block_mask(seq_len_with_mem, self.attn_window_size, self.num_persist_mem_features, self.sliding_window_attn)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # kv caching
@@ -779,7 +738,7 @@ class MemoryAsContextTransformer(Module):
 
         mem_input_layers = []
 
-        # when inferencing, only do one token at a time
+        # when inferencing, only do one feature at a time
 
         if is_inferencing:
             ind = inference_seq_index
@@ -865,7 +824,7 @@ class MemoryAsContextTransformer(Module):
             x = add_ff_residual(ff_out)
 
         # taking care of cache first
-        # for early return when processing long term mem tokens during inference
+        # for early return when processing long term mem features during inference
 
         if return_cache:
             next_kv_caches = stack([stack(kv_cache) for kv_cache in next_kv_caches])
@@ -906,16 +865,12 @@ class MemoryAsContextTransformer(Module):
 
             x = x[:, :seq_len]
 
-        # to logits
-
-        x = self.norm(x)
-
-        logits = self.to_logits(x)
+        y = self.norm(x)
 
         if not return_loss:
             if not return_cache:
-                return logits
+                return y
 
-            return logits, next_cache
+            return y, next_cache
 
-        return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
+        return F.l1_loss(y, labels)
