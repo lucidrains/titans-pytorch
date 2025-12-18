@@ -1,3 +1,14 @@
+# /// script
+# dependencies = [
+#     "accelerate",
+#     "adam-atan2-pytorch>=0.1.18",
+#     "setuptools",
+#     "titans-pytorch",
+#     "tqdm",
+#     "wandb"
+# ]
+# ///
+
 import random
 import tqdm
 import gzip
@@ -166,7 +177,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         loss = model(next(train_loader), return_loss = True)
         loss.backward()
 
-    print(f'training loss: {loss.item()}')
+    print(f'training loss: {loss.item():.4f}')
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
@@ -176,7 +187,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         model.eval()
         with torch.no_grad():
             loss = model(next(val_loader), return_loss = True)
-            print(f'validation loss: {loss.item()}')
+            print(f'validation loss: {loss.item():.4f}')
 
     if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
         model.eval()

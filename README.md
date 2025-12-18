@@ -63,13 +63,13 @@ sampled = transformer.sample(token_ids[:, :4], 512)
 ## Experiments
 
 ```bash
-$ pip install .[examples]
+$ pip install uv
 ```
 
 Then modify `train_mac.py` and run it to query nature
 
 ```bash
-$ python train_mac.py
+$ uv run train_mac.py
 ```
 
 ## Citations
