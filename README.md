@@ -8,6 +8,8 @@ Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytor
 
 [Paper review by Yannic](https://www.youtube.com/watch?v=v67plFw1nMw)
 
+[Quick Colab Run](https://colab.research.google.com/drive/11cGgSABykte3qbK-hjzPgLif3-9UUejm?usp=sharing)
+
 ## Appreciation
 
 - [Eryk](https://github.com/sentialx) for sharing his early experimental results with me, positive for 2 layer MLP
