@@ -13,7 +13,7 @@ import random
 import tqdm
 import gzip
 import numpy as np
-
+import os
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
@@ -28,7 +28,8 @@ from titans_pytorch import (
 )
 
 # constants
-
+SAVE_DIR = './saved_models'
+SAVE_FILENAME = 'mac_transformer.pt'
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
@@ -198,3 +199,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
         output_str = decode_tokens(sample[0])
         print(output_str)
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+model_save_path = os.path.join(SAVE_DIR, SAVE_FILENAME)
+torch.save(model.state_dict(), model_save_path)
