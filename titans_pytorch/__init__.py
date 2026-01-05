@@ -4,6 +4,10 @@ from titans_pytorch.neural_memory import (
     mem_state_detach
 )
 
+from titans_pytorch.neural_memory_attn_gated import (
+    NeuralMemoryAttnGated
+)
+
 from titans_pytorch.memory_models import (
     MemoryMLP,
     MemoryAttention,

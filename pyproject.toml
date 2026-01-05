@@ -25,7 +25,7 @@ classifiers=[
 ]
 
 dependencies = [
-    "assoc-scan",
+    "assoc-scan>=0.0.4",
     "axial_positional_embedding>=0.3.10",
     "einops>=0.8.0",
     "einx>=0.3.0",
