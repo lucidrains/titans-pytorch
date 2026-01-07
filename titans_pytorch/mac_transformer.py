@@ -63,7 +63,7 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from x_transformers.attend import Attend
 
-from hyper_connections import get_init_and_expand_reduce_stream_functions
+from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
 # proposed neural memory
 
@@ -523,7 +523,7 @@ class MemoryAsContextTransformer(Module):
 
         # hyper connection
 
-        init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim, add_stream_embed = True, disable = num_residual_streams == 1)
+        init_hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim, add_stream_embed = True, disable = num_residual_streams == 1)
 
         self.layers = ModuleList([])
 

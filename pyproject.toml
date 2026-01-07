@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.4.25"
+version = "0.5.0"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -29,7 +29,7 @@ dependencies = [
     "axial_positional_embedding>=0.3.10",
     "einops>=0.8.0",
     "einx>=0.3.0",
-    "hyper-connections>=0.1.11",
+    "hyper-connections>=0.3.11",
     "Ninja",
     "rotary-embedding-torch",
     "tensordict",
