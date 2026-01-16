@@ -37,6 +37,30 @@ retrieved, mem_state = mem(seq)
 assert seq.shape == retrieved.shape
 ```
 
+### Stateful inference with gradient detachment
+
+When using `NeuralMemory` in a loop with backpropagation, you need to detach the memory state to avoid errors like "Trying to backward through the graph a second time". Use `mem_state_detach`:
+
+```python
+import torch
+from titans_pytorch import NeuralMemory
+from titans_pytorch.neural_memory import mem_state_detach
+
+mem = NeuralMemory(
+    dim = 384,
+    chunk_size = 64
+)
+
+seq = torch.randn(4, 64, 384)
+state = None
+
+for _ in range(10):
+    retrieved, state = mem(seq, state=state)
+    # Detach state before next backward pass to break the computation graph
+    state = mem_state_detach(state)
+    retrieved.sum().backward()
+```
+
 A transformer with the `MAC` configuration can be used as
 
 ```python
@@ -64,14 +88,23 @@ sampled = transformer.sample(token_ids[:, :4], 512)
 
 ## Experiments
 
+The training scripts use [PEP 723](https://peps.python.org/pep-0723/) inline script dependencies. Install `uv` to run them:
+
 ```bash
 $ pip install uv
 ```
 
-Then modify `train_mac.py` and run it to query nature
+Then run the training script (dependencies like `adam-atan2-pytorch` will be installed automatically):
 
 ```bash
 $ uv run train_mac.py
+```
+
+Alternatively, install dependencies manually and run with Python:
+
+```bash
+$ pip install adam-atan2-pytorch accelerate wandb tqdm
+$ python train_mac.py
 ```
 
 ## Citations
