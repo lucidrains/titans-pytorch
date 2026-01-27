@@ -850,7 +850,9 @@ class MemoryAsContextTransformer(Module):
             # caches
 
             next_kv_caches.append(next_kv_cache)
-            next_neural_mem_caches.append(next_neural_mem_cache)
+
+            if exists(mem):
+                next_neural_mem_caches.append(next_neural_mem_cache)
 
             # feedforward
 
