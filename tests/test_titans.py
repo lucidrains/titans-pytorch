@@ -35,6 +35,7 @@ def torch_default_dtype(dtype):
 @pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
 @pytest.mark.parametrize('per_head_learned_parameters', (False, True))
 @pytest.mark.parametrize('test_store_mask', (False, True))
+@pytest.mark.parametrize('store_with_lookahead_value', (False, True))
 def test_titans(
     seq_len,
     silu,
@@ -47,7 +48,8 @@ def test_titans(
     num_kv_per_token,
     per_parameter_lr_modulation,
     per_head_learned_parameters,
-    test_store_mask
+    test_store_mask,
+    store_with_lookahead_value
 ):
     mem = NeuralMemory(
         dim = 16,
@@ -60,7 +62,8 @@ def test_titans(
         qk_rmsnorm = qk_rmsnorm,
         heads = heads,
         per_parameter_lr_modulation = per_parameter_lr_modulation,
-        per_head_learned_parameters = per_head_learned_parameters
+        per_head_learned_parameters = per_head_learned_parameters,
+        store_with_lookahead_value = store_with_lookahead_value
     )
 
     seq = torch.randn(2, seq_len, 16)

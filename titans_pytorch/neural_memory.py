@@ -289,7 +289,8 @@ class NeuralMemory(Module):
         accept_weight_residual = False,
         spectral_norm_surprises = False,
         gated_transition = False,
-        mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        store_with_lookahead_value = True,   # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -422,6 +423,8 @@ class NeuralMemory(Module):
             LinearNoBias(dim, dim_inner * num_kv_per_token),
             activation,
         )
+
+        self.store_with_lookahead_value = store_with_lookahead_value
 
         self.store_memory_loss_fn = store_memory_loss_fn
 
@@ -691,6 +694,13 @@ class NeuralMemory(Module):
         # flatten batch and time if surprise depends on previous layer memory model
 
         weights_for_surprise = rearrange_dict_values(weights_for_surprise, 'b n ... -> (b n) ...')
+
+        # maybe lookahead values
+
+        if self.store_with_lookahead_value:
+            adaptive_lr = adaptive_lr[..., :-1]
+            keys = keys[..., :-1, :]
+            values = values[..., 1:, :]
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
