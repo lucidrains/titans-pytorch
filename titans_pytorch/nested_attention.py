@@ -116,8 +116,8 @@ if __name__ == '__main__':
 
     tokens = torch.randn(1, 1024, 512)
 
-    out1, cache = nested_attn(tokens)
-    out2, cache = nested_attn(tokens[:, -1:], cache = cache)
+    out1, cache = nested_attn(tokens, return_kv_cache = True)
+    out2, cache = nested_attn(tokens[:, -1:], cache = cache, return_kv_cache = True)
 
     assert out1.shape == tokens.shape
     assert out2.shape == (1, 1, 512)

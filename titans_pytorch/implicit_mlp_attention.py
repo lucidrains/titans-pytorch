@@ -155,7 +155,7 @@ if __name__ == '__main__':
 
     tokens = torch.randn(1, 1024, 512)
 
-    out, cache = implicit_mlp_attn(tokens)
-    out, cache = implicit_mlp_attn(tokens, cache = cache)
+    out, cache = implicit_mlp_attn(tokens, return_kv_cache = True)
+    out, cache = implicit_mlp_attn(tokens, cache = cache, return_kv_cache = True)
 
     assert out.shape == tokens.shape
