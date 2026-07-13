@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.5.3"
+version = "0.5.5"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -71,3 +71,11 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["titans_pytorch"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "titans_pytorch",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]

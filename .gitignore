@@ -1,3 +1,5 @@
+*.sh
+
 train_local.py
 .DS_Store
 
