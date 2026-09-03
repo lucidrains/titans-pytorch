@@ -150,9 +150,12 @@ def softclamp_grad_norm(t, max_value):
     t, inverse = pack_one_with_inverse(t, 'bn *')
 
     norm = t.norm(dim = -1, keepdim = True)
+    # Keep the rescaling finite when a parameter receives an exactly-zero
+    # gradient (or when a low-precision norm underflows to zero).
+    safe_norm = norm.clamp_min(torch.finfo(norm.dtype).eps)
     clamped_norm = softclamp_max(norm, max_value)
 
-    t = t * (clamped_norm / norm)
+    t = t * (clamped_norm / safe_norm)
     return inverse(t)
 
 # spectral norming the surprise update w/ newton schulz matrix iter
