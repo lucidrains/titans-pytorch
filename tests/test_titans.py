@@ -475,3 +475,29 @@ def test_mem_state_detach():
         parallel_retrieved, state = mem(seq, state = state)
         state = mem_state_detach(state)
         parallel_retrieved.sum().backward()
+
+def test_per_head_parameters_not_aliased():
+    # per-head memory parameters must own their storage; a stride-0 broadcast view
+    # makes every head alias one tensor, which breaks any optimizer and load_state_dict
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        dim_head = 8,
+        heads = 16
+    )
+
+    for name, p in mem.memory_model_parameters.named_parameters():
+        assert p.stride(0) != 0, f'memory_model_parameters.{name} shares storage across heads'
+
+    opt = torch.optim.AdamW(mem.parameters(), lr = 1e-2)
+    out, _ = mem(torch.randn(2, 32, 16))
+    out.sum().backward()
+    opt.step()
+
+    other = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        dim_head = 8,
+        heads = 16
+    )
+    other.load_state_dict(mem.state_dict())
