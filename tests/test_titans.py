@@ -510,6 +510,52 @@ def test_assoc_scan(
 
     assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-5)
 
+@pytest.mark.parametrize('segments', ((1, 3), (1, 7), (3, 2, 3), (1, 2, 4), (5, 2, 1), (5, 1, 2)))
+@pytest.mark.parametrize('chunk_size', (2, 4))
+@pytest.mark.parametrize('batch_size', (None, 4))
+@pytest.mark.parametrize('gated_transition', (False, True))
+def test_neural_mem_cached_continuation(segments, chunk_size, batch_size, gated_transition):
+    with torch.random.fork_rng():
+        torch.manual_seed(5)
+        mem = NeuralMemory(
+            dim = 8,
+            dim_head = 4,
+            heads = 2,
+            chunk_size = chunk_size,
+            batch_size = batch_size,
+            gated_transition = gated_transition
+        ).double()
+        seq = torch.randn(2, sum(segments), 8, dtype = torch.float64)
+
+    parameters = tuple(mem.parameters())
+    expected, expected_state = mem(seq)
+    expected_grads = torch.autograd.grad(expected.square().mean(), parameters, allow_unused = True)
+
+    state = None
+    retrieved = []
+    for segment in seq.split(segments, dim = 1):
+        values, state = mem(segment, state = state)
+        retrieved.append(values)
+
+    retrieved = torch.cat(retrieved, dim = 1)
+    torch.testing.assert_close(retrieved, expected, atol = 1e-11, rtol = 1e-9)
+
+    if exists(expected_state.cache_store_segment):
+        torch.testing.assert_close(state.cache_store_segment, expected_state.cache_store_segment)
+    else:
+        assert state.cache_store_segment is None
+
+    for actual_part, expected_part in zip(state.states, expected_state.states):
+        for name in expected_part.keys():
+            torch.testing.assert_close(actual_part[name], expected_part[name], atol = 1e-11, rtol = 1e-9)
+
+    actual_grads = torch.autograd.grad(retrieved.square().mean(), parameters, allow_unused = True)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        if expected_grad is None:
+            assert actual_grad is None
+        else:
+            torch.testing.assert_close(actual_grad, expected_grad, atol = 1e-11, rtol = 1e-9)
+
 def test_mem_state_detach():
     from titans_pytorch.neural_memory import mem_state_detach
 

@@ -836,7 +836,10 @@ class NeuralMemory(Module):
         self,
         seq,
         weights: dict[str, Tensor],
+        seq_offset = 0
     ):
+        """Align query chunks with the cached storage tokens preceding this sequence."""
+
         chunk_size = self.retrieve_chunk_size
 
         weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
@@ -857,14 +860,16 @@ class NeuralMemory(Module):
 
         need_pad = chunk_size > 1 or not is_one_weight
 
+        left_pad = (1 + seq_offset) if need_pad else 0
+
         if need_pad:
-            seq = pad_at_dim(seq, (1, 0), dim = 1)
+            seq = pad_at_dim(seq, (left_pad, 0), dim = 1)
 
-        seq_len_plus_one = seq.shape[-2]
+        padded_seq_len = seq.shape[-2]
 
-        next_seq_len = round_up_multiple(seq_len_plus_one, chunk_size)
+        next_seq_len = round_up_multiple(padded_seq_len, chunk_size)
 
-        padding = next_seq_len - seq_len_plus_one
+        padding = next_seq_len - padded_seq_len
         seq = pad_at_dim(seq, (0, padding), dim = 1)
 
         # the parameters of the memory model stores the memories of the key / values
@@ -919,7 +924,7 @@ class NeuralMemory(Module):
         # restore, pad with empty memory embed
 
         if need_pad:
-            values = values[:, 1:]
+            values = values[:, left_pad:]
 
         return values[:, :seq_len]
 
@@ -1068,6 +1073,18 @@ class NeuralMemory(Module):
 
             weights = last_update
 
+            # keep the retrieval updates consistent with the gated weights used for the last chunk of a completed minibatch
+
+            if exists(updates):
+                gated_updates = TensorDict()
+
+                for param_name in updates.keys():
+                    updated = updates[param_name].clone()
+                    updated[:, -1] = last_update[param_name]
+                    gated_updates[param_name] = updated
+
+                updates = gated_updates
+
             next_neural_mem_state = next_neural_mem_state._replace(
                 weights = weights,
                 states = past_state,
@@ -1083,7 +1100,8 @@ class NeuralMemory(Module):
 
         retrieved = self.retrieve_memories(
             retrieve_seq,
-            updates
+            updates,
+            seq_offset = cache_store_seq.shape[-2] if exists(cache_store_seq) else 0
         )
 
         # maybe detach
