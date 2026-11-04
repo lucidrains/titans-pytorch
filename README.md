@@ -22,6 +22,8 @@ $ pip install titans-pytorch
 
 ## Usage
 
+Pass the returned `mem_state` back as `state` to continue a sequence. Retrieval keeps its chunk alignment when a continuation begins partway through a cached storage chunk: the cached prefix length shifts the retrieval chunk phase, so each query chunk fetches the memory accumulated up to the matching chunk of the whole sequence rather than resetting to the first chunk.
+
 ```python
 import torch
 from titans_pytorch import NeuralMemory
