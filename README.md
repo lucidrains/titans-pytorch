@@ -22,8 +22,6 @@ $ pip install titans-pytorch
 
 ## Usage
 
-Pass the returned `mem_state` back as `state` to continue a sequence. Retrieval keeps its chunk alignment when a continuation begins partway through a cached storage chunk: the cached prefix length shifts the retrieval chunk phase, so each query chunk fetches the memory accumulated up to the matching chunk of the whole sequence rather than resetting to the first chunk.
-
 ```python
 import torch
 from titans_pytorch import NeuralMemory
@@ -38,14 +36,6 @@ retrieved, mem_state = mem(seq)
 
 assert seq.shape == retrieved.shape
 ```
-
-When continuing with `mem(seq, state = mem_state, store_mask = store_mask)`, pass
-only the storage mask for the new tokens. `NeuralMemState.cache_store_mask`
-keeps the mask for any unfinished cached storage chunk alongside
-`cache_store_segment`. Omitting the mask for a new call allows storing all of
-that call's tokens; it does not unmask cached tokens. The state fields are
-`seq_index`, `weights`, `cache_store_segment`, `cache_store_mask`, `states`,
-and `updates`.
 
 A transformer with the `MAC` configuration can be used as
 

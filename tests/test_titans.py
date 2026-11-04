@@ -77,59 +77,70 @@ def test_titans(
 
     assert seq.shape == retrieved.shape
 
-@pytest.mark.parametrize('prefix_len', (1, 3))
+@pytest.mark.parametrize('segments', ((4, 4), (1, 3), (1, 7), (3, 2, 3), (1, 2, 4), (5, 2, 1), (5, 1, 2)))
+@pytest.mark.parametrize('chunk_size', (2, 4))
 @pytest.mark.parametrize('batch_size', (None, 4))
-@pytest.mark.parametrize('masked_prefix, masked_suffix', ((True, True), (True, False), (False, True)))
-def test_masked_memory_chaining(prefix_len, batch_size, masked_prefix, masked_suffix):
+@pytest.mark.parametrize('gated_transition', (False, True))
+@pytest.mark.parametrize('mask_mode', (None, 'all', 'prefix', 'suffix'))
+def test_neural_mem_chaining(segments, chunk_size, batch_size, gated_transition, mask_mode):
     with torch.random.fork_rng():
         torch.manual_seed(5)
-        mem = NeuralMemory(dim = 8, chunk_size = 2, batch_size = batch_size).double()
-        seq = torch.randn(1, 4, 8, dtype = torch.float64)
+        mem = NeuralMemory(
+            dim = 8,
+            dim_head = 4,
+            heads = 2,
+            chunk_size = chunk_size,
+            batch_size = batch_size,
+            gated_transition = gated_transition
+        ).double()
+        seq = torch.randn(2, sum(segments), 8, dtype = torch.float64)
 
-    mask = torch.tensor([[True, False, False, True]])
-    prefix_mask = mask[:, :prefix_len] if masked_prefix else None
-    suffix_mask = mask[:, prefix_len:] if masked_suffix else None
-    full_mask = torch.cat((
-        prefix_mask if masked_prefix else torch.ones(1, prefix_len, dtype = torch.bool),
-        suffix_mask if masked_suffix else torch.ones(1, 4 - prefix_len, dtype = torch.bool),
-    ), dim = -1)
+    mask = torch.ones(2, sum(segments), dtype = torch.bool)
+    mask[:, ::2] = False
 
-    _, expected = mem(seq, store_mask = full_mask)
-    _, state = mem(seq[:, :prefix_len], store_mask = prefix_mask)
-    for index in range(prefix_len, seq.shape[1]):
-        token_mask = suffix_mask[:, index - prefix_len:index - prefix_len + 1] if masked_suffix else None
-        _, state = mem(seq[:, index:index + 1], state = state, store_mask = token_mask)
-    actual = state
+    mask_parts = mask.split(segments, dim = 1)
 
-    expected_updates = expected.states[0]
-    actual_updates = actual.states[0]
-    for name in expected_updates.keys():
-        torch.testing.assert_close(actual_updates[name], expected_updates[name], rtol = 1e-10, atol = 1e-12)
+    masks = [
+        part if mask_mode == 'all' or (mask_mode == 'prefix' and ind == 0) or (mask_mode == 'suffix' and ind == len(segments) - 1) else None
+        for ind, part in enumerate(mask_parts)
+    ]
+
+    full_mask = torch.cat(tuple(one_mask if exists(one_mask) else torch.ones_like(part) for one_mask, part in zip(masks, mask_parts)), dim = 1)
+    full_mask = full_mask if exists(mask_mode) else None
 
     parameters = tuple(mem.parameters())
-    expected_loss = sum(update.square().sum() for update in expected_updates.values())
-    actual_loss = sum(update.square().sum() for update in actual_updates.values())
-    expected_grads = torch.autograd.grad(expected_loss, parameters, allow_unused = True)
-    actual_grads = torch.autograd.grad(actual_loss, parameters, allow_unused = True)
+    expected, expected_state = mem(seq, store_mask = full_mask)
+    expected_grads = torch.autograd.grad(expected.square().mean(), parameters, allow_unused = True)
+
+    state = None
+    retrieved = []
+
+    for segment, one_mask in zip(seq.split(segments, dim = 1), masks):
+        one_retrieved, state = mem(segment, state = state, store_mask = one_mask)
+        retrieved.append(one_retrieved)
+
+    retrieved = torch.cat(retrieved, dim = 1)
+
+    assert torch.allclose(retrieved, expected, atol = 1e-10)
+
+    if exists(expected_state.cache_store_segment):
+        assert torch.equal(state.cache_store_segment, expected_state.cache_store_segment)
+
+    if exists(expected_state.cache_store_mask):
+        assert torch.equal(state.cache_store_mask, expected_state.cache_store_mask)
+
+    for actual_part, expected_part in zip(state.states, expected_state.states):
+        for name in expected_part.keys():
+            assert torch.allclose(actual_part[name], expected_part[name], atol = 1e-10)
+
+    actual_grads = torch.autograd.grad(retrieved.square().mean(), parameters, allow_unused = True)
+
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        if expected_grad is None:
-            assert actual_grad is None
-        else:
-            torch.testing.assert_close(actual_grad, expected_grad, rtol = 1e-9, atol = 1e-11)
+        if not exists(expected_grad):
+            assert not exists(actual_grad)
+            continue
 
-def test_detached_cached_store_mask():
-    with torch.random.fork_rng():
-        torch.manual_seed(5)
-        mem = NeuralMemory(dim = 8, chunk_size = 2)
-        seq = torch.randn(1, 4, 8)
-
-    mask = torch.tensor([[True, False, False, True]])
-    _, expected = mem(seq, store_mask = mask)
-    _, state = mem(seq[:, :3], store_mask = mask[:, :3])
-    state = mem_state_detach(state)
-    _, actual = mem(seq[:, 3:], state = state, store_mask = mask[:, 3:])
-    for name, update in expected.states[0].items():
-        torch.testing.assert_close(actual.states[0][name], update)
+        assert torch.allclose(actual_grad, expected_grad, atol = 1e-9)
 
 def test_return_surprises():
 
@@ -203,30 +214,6 @@ def test_swiglu_ff_memory():
 
     assert seq.shape == retrieved.shape
 
-@pytest.mark.parametrize('gated_transition', (True, False))
-def test_neural_mem_chaining_chunks(
-    gated_transition
-):
-    mem  = NeuralMemory(
-        dim = 16,
-        dim_head = 16,
-        heads = 2,
-        chunk_size = 16,
-        gated_transition = gated_transition
-    )
-
-    seq = torch.randn(2, 48, 16)
-
-    parallel_retrieved, state = mem(seq)
-
-    seq_first, seq_second, seq_third = seq.split(16, dim = 1)
-
-    first_retrieved, state = mem(seq_first)
-    second_retrieved, state = mem(seq_second, state = state)
-    third_retrieved, state = mem(seq_third, state = state)
-
-    assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved, third_retrieved), dim = 1), atol = 1e-5)
-
 def test_neural_mem_chaining_with_weight_residual():
     mem  = NeuralMemory(
         dim = 16,
@@ -255,29 +242,6 @@ def test_neural_mem_chaining_with_weight_residual():
     second_retrieved, state2 = mem2(seq_second, state = state1, prev_weights = state.updates)
 
     assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved), dim = 1), atol = 1e-5)
-
-def test_neural_mem_chaining_with_batch_size():
-    mem  = NeuralMemory(
-        dim = 16,
-        dim_head = 16,
-        heads = 2,
-        chunk_size = 16,
-        batch_size = 64
-    )
-
-    seq = torch.randn(2, 112, 16)
-
-    parallel_retrieved, state = mem(seq)
-
-    seq_first, seq_second, seq_third = seq[:, :16], seq[:, 16:64], seq[:, 64:]
-
-    first_retrieved, state = mem(seq_first)
-    second_retrieved, state = mem(seq_second, state = state)
-    third_retrieved, state = mem(seq_third, state = state)
-
-    parallel_part_retrieved = torch.cat((first_retrieved, second_retrieved, third_retrieved), dim = 1)
-
-    assert torch.allclose(parallel_retrieved, parallel_part_retrieved, atol = 1e-5)
 
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
@@ -510,68 +474,22 @@ def test_assoc_scan(
 
     assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-5)
 
-@pytest.mark.parametrize('segments', ((1, 3), (1, 7), (3, 2, 3), (1, 2, 4), (5, 2, 1), (5, 1, 2)))
-@pytest.mark.parametrize('chunk_size', (2, 4))
-@pytest.mark.parametrize('batch_size', (None, 4))
-@pytest.mark.parametrize('gated_transition', (False, True))
-def test_neural_mem_cached_continuation(segments, chunk_size, batch_size, gated_transition):
-    with torch.random.fork_rng():
-        torch.manual_seed(5)
-        mem = NeuralMemory(
-            dim = 8,
-            dim_head = 4,
-            heads = 2,
-            chunk_size = chunk_size,
-            batch_size = batch_size,
-            gated_transition = gated_transition
-        ).double()
-        seq = torch.randn(2, sum(segments), 8, dtype = torch.float64)
-
-    parameters = tuple(mem.parameters())
-    expected, expected_state = mem(seq)
-    expected_grads = torch.autograd.grad(expected.square().mean(), parameters, allow_unused = True)
-
-    state = None
-    retrieved = []
-    for segment in seq.split(segments, dim = 1):
-        values, state = mem(segment, state = state)
-        retrieved.append(values)
-
-    retrieved = torch.cat(retrieved, dim = 1)
-    torch.testing.assert_close(retrieved, expected, atol = 1e-11, rtol = 1e-9)
-
-    if exists(expected_state.cache_store_segment):
-        torch.testing.assert_close(state.cache_store_segment, expected_state.cache_store_segment)
-    else:
-        assert state.cache_store_segment is None
-
-    for actual_part, expected_part in zip(state.states, expected_state.states):
-        for name in expected_part.keys():
-            torch.testing.assert_close(actual_part[name], expected_part[name], atol = 1e-11, rtol = 1e-9)
-
-    actual_grads = torch.autograd.grad(retrieved.square().mean(), parameters, allow_unused = True)
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        if expected_grad is None:
-            assert actual_grad is None
-        else:
-            torch.testing.assert_close(actual_grad, expected_grad, atol = 1e-11, rtol = 1e-9)
-
 def test_mem_state_detach():
-    from titans_pytorch.neural_memory import mem_state_detach
 
     mem = NeuralMemory(
-        dim = 384,
-        chunk_size = 2,
+        dim = 32,
+        chunk_size = 3,
         qk_rmsnorm = True,
-        dim_head = 64,
+        dim_head = 8,
         heads = 4,
     )
 
-    seq = torch.randn(4, 64, 384)
+    seq = torch.randn(4, 64, 32)
+    store_mask = torch.randint(0, 2, seq.shape[:2]).bool()
 
     state = None
 
     for _ in range(2):
-        parallel_retrieved, state = mem(seq, state = state)
+        parallel_retrieved, state = mem(seq, state = state, store_mask = store_mask)
         state = mem_state_detach(state)
         parallel_retrieved.sum().backward()

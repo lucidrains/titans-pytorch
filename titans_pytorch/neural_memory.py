@@ -26,6 +26,8 @@ import einx
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
+from torch_einops_utils.shape import shape, size
+
 """
 ein notation:
 b - batch
@@ -168,8 +170,7 @@ def newtonschulz5(
     if t.ndim <= 3:
         return t
 
-    shape = t.shape
-    should_transpose = shape[-2] > shape[-1]
+    should_transpose = t.shape[-2] > t.shape[-1]
 
     if should_transpose:
         t = t.transpose(-1, -2)
@@ -583,10 +584,7 @@ class NeuralMemory(Module):
         mask: Tensor | None = None,
         return_surprises = True
     ):
-        if self.qkv_receives_diff_views:
-            _, batch, seq_len = seq.shape[:3]
-        else:
-            batch, seq_len = seq.shape[:2]
+        batch, seq_len = shape(seq, '... [b n] d')
 
         # shapes and variables
 
@@ -674,13 +672,11 @@ class NeuralMemory(Module):
         remainder_mask = None
 
         if exists(mask):
-            remainder_mask = mask[..., round_down_seq_len:seq_len] if seq_len > round_down_seq_len else None
+            remainder_mask = mask[..., round_down_seq_len:] if seq_len > round_down_seq_len else None
             mask = mask[..., :round_down_seq_len]
             mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
 
             adaptive_lr = torch.where(mask, adaptive_lr, 0.)
-
-        # maybe add previous layer weight
 
         assert xnor(exists(self.to_learned_weight_residual_mix), exists(prev_weights))
 
@@ -688,7 +684,7 @@ class NeuralMemory(Module):
 
             start_index = math.ceil(seq_index / chunk_size)
             end_index = start_index + num_chunks
-            prev_num_chunks = dict_first_value(prev_weights).shape[1]
+            prev_num_chunks = size(dict_first_value(prev_weights), 'b [n] ...')
 
             if end_index <= prev_num_chunks:
                 prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
@@ -757,7 +753,7 @@ class NeuralMemory(Module):
         # early return if sequence length less than chunk size
 
         if num_chunks == 0:
-            updates = rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
+            updates = rearrange_dict_values(past_last_update, 'bh ... -> bh 1 ...')
             next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, remainder_mask, past_state, updates)
 
             output = (updates, next_store_state)
@@ -838,18 +834,18 @@ class NeuralMemory(Module):
         weights: dict[str, Tensor],
         seq_offset = 0
     ):
-        """Align query chunks with the cached storage tokens preceding this sequence."""
+        # shift query chunks by any cached storage tokens
 
         chunk_size = self.retrieve_chunk_size
 
         weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
 
-        batch, seq_len = seq.shape[:2]
+        batch, seq_len = shape(seq, '[b n] d')
 
         # auto infer single token decoding, if there are only 1 set of weights and 1 token
 
         is_one_token = seq_len == 1
-        is_one_weight = (not weights_have_expanded_shape) or dict_first_value(weights).shape[1] == 1
+        is_one_weight = (not weights_have_expanded_shape) or size(dict_first_value(weights), 'b [n] ...') == 1
 
         is_single_token_decode = is_one_token and is_one_weight
 
@@ -860,12 +856,12 @@ class NeuralMemory(Module):
 
         need_pad = chunk_size > 1 or not is_one_weight
 
-        left_pad = (1 + seq_offset) if need_pad else 0
+        left_pad = 1 + seq_offset if need_pad else 0
 
         if need_pad:
             seq = pad_at_dim(seq, (left_pad, 0), dim = 1)
 
-        padded_seq_len = seq.shape[-2]
+        padded_seq_len = size(seq, 'b [n] d')
 
         next_seq_len = round_up_multiple(padded_seq_len, chunk_size)
 
@@ -946,7 +942,7 @@ class NeuralMemory(Module):
         if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
             seq = rearrange(seq, '... b d -> ... b 1 d')
 
-        is_single_token = seq.shape[-2] == 1
+        is_single_token = size(seq, '... [n] d') == 1
 
         # if different views for qkv, then
 
@@ -970,10 +966,8 @@ class NeuralMemory(Module):
 
         if exists(cache_store_seq):
             if exists(cache_store_mask) or exists(store_mask):
-                if not exists(cache_store_mask):
-                    cache_store_mask = torch.ones(cache_store_seq.shape[-3:-1], dtype = torch.bool, device = cache_store_seq.device)
-                if not exists(store_mask):
-                    store_mask = torch.ones(store_seq.shape[-3:-1], dtype = torch.bool, device = store_seq.device)
+                cache_store_mask = default(cache_store_mask, torch.ones(shape(cache_store_seq, '... [b n] d').shape, dtype = torch.bool, device = cache_store_seq.device))
+                store_mask = default(store_mask, torch.ones(shape(store_seq, '... [b n] d').shape, dtype = torch.bool, device = store_seq.device))
                 store_mask = cat((cache_store_mask, store_mask), dim = -1)
 
             store_seq = safe_cat((cache_store_seq, store_seq))
@@ -981,7 +975,7 @@ class NeuralMemory(Module):
         # compute split sizes of sequence
         # for now manually update weights to last update at the correct boundaries
 
-        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, default(ttt_batch_size, self.batch_size)
+        store_seq_len, chunk_size, batch_size = size(store_seq, '... [n] d'), self.chunk_size, default(ttt_batch_size, self.batch_size)
 
         need_update_weights = exists(batch_size)
 
@@ -1073,17 +1067,13 @@ class NeuralMemory(Module):
 
             weights = last_update
 
-            # keep the retrieval updates consistent with the gated weights used for the last chunk of a completed minibatch
+            # align last retrieval update with gated weights
 
             if exists(updates):
-                gated_updates = TensorDict()
-
-                for param_name in updates.keys():
-                    updated = updates[param_name].clone()
-                    updated[:, -1] = last_update[param_name]
-                    gated_updates[param_name] = updated
-
-                updates = gated_updates
+                updates = TensorDict({
+                    name: cat((update[:, :-1], rearrange(last_update[name], 'b ... -> b 1 ...')), dim = 1)
+                    for name, update in updates.items()
+                })
 
             next_neural_mem_state = next_neural_mem_state._replace(
                 weights = weights,
@@ -1101,7 +1091,7 @@ class NeuralMemory(Module):
         retrieved = self.retrieve_memories(
             retrieve_seq,
             updates,
-            seq_offset = cache_store_seq.shape[-2] if exists(cache_store_seq) else 0
+            seq_offset = size(cache_store_seq, '... [n] d') if exists(cache_store_seq) else 0
         )
 
         # maybe detach
