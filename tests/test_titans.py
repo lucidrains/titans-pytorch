@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 import pytest
-from titans_pytorch import NeuralMemory
+from titans_pytorch import NeuralMemory, mem_state_detach
 from titans_pytorch.mac_transformer import flex_attention, SegmentedAttention, MemoryAsContextTransformer
 
 # functions
@@ -76,6 +76,60 @@ def test_titans(
     retrieved, _ = mem(seq, store_mask = store_mask)
 
     assert seq.shape == retrieved.shape
+
+@pytest.mark.parametrize('prefix_len', (1, 3))
+@pytest.mark.parametrize('batch_size', (None, 4))
+@pytest.mark.parametrize('masked_prefix, masked_suffix', ((True, True), (True, False), (False, True)))
+def test_masked_memory_chaining(prefix_len, batch_size, masked_prefix, masked_suffix):
+    with torch.random.fork_rng():
+        torch.manual_seed(5)
+        mem = NeuralMemory(dim = 8, chunk_size = 2, batch_size = batch_size).double()
+        seq = torch.randn(1, 4, 8, dtype = torch.float64)
+
+    mask = torch.tensor([[True, False, False, True]])
+    prefix_mask = mask[:, :prefix_len] if masked_prefix else None
+    suffix_mask = mask[:, prefix_len:] if masked_suffix else None
+    full_mask = torch.cat((
+        prefix_mask if masked_prefix else torch.ones(1, prefix_len, dtype = torch.bool),
+        suffix_mask if masked_suffix else torch.ones(1, 4 - prefix_len, dtype = torch.bool),
+    ), dim = -1)
+
+    _, expected = mem(seq, store_mask = full_mask)
+    _, state = mem(seq[:, :prefix_len], store_mask = prefix_mask)
+    for index in range(prefix_len, seq.shape[1]):
+        token_mask = suffix_mask[:, index - prefix_len:index - prefix_len + 1] if masked_suffix else None
+        _, state = mem(seq[:, index:index + 1], state = state, store_mask = token_mask)
+    actual = state
+
+    expected_updates = expected.states[0]
+    actual_updates = actual.states[0]
+    for name in expected_updates.keys():
+        torch.testing.assert_close(actual_updates[name], expected_updates[name], rtol = 1e-10, atol = 1e-12)
+
+    parameters = tuple(mem.parameters())
+    expected_loss = sum(update.square().sum() for update in expected_updates.values())
+    actual_loss = sum(update.square().sum() for update in actual_updates.values())
+    expected_grads = torch.autograd.grad(expected_loss, parameters, allow_unused = True)
+    actual_grads = torch.autograd.grad(actual_loss, parameters, allow_unused = True)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        if expected_grad is None:
+            assert actual_grad is None
+        else:
+            torch.testing.assert_close(actual_grad, expected_grad, rtol = 1e-9, atol = 1e-11)
+
+def test_detached_cached_store_mask():
+    with torch.random.fork_rng():
+        torch.manual_seed(5)
+        mem = NeuralMemory(dim = 8, chunk_size = 2)
+        seq = torch.randn(1, 4, 8)
+
+    mask = torch.tensor([[True, False, False, True]])
+    _, expected = mem(seq, store_mask = mask)
+    _, state = mem(seq[:, :3], store_mask = mask[:, :3])
+    state = mem_state_detach(state)
+    _, actual = mem(seq[:, 3:], state = state, store_mask = mask[:, 3:])
+    for name, update in expected.states[0].items():
+        torch.testing.assert_close(actual.states[0][name], update)
 
 def test_return_surprises():
 

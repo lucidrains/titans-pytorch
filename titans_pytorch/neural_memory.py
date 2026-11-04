@@ -47,6 +47,7 @@ NeuralMemState = namedtuple('NeuralMemState', [
     'seq_index',
     'weights',
     'cache_store_segment',
+    'cache_store_mask',
     'states',
     'updates',
 ])
@@ -670,7 +671,10 @@ class NeuralMemory(Module):
 
         # optionally a storing memories mask can be passed in. if False, will set the learning rate to 0. for those positions
 
+        remainder_mask = None
+
         if exists(mask):
+            remainder_mask = mask[..., round_down_seq_len:seq_len] if seq_len > round_down_seq_len else None
             mask = mask[..., :round_down_seq_len]
             mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
 
@@ -754,7 +758,7 @@ class NeuralMemory(Module):
 
         if num_chunks == 0:
             updates = rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
-            next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, past_state, updates)
+            next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, remainder_mask, past_state, updates)
 
             output = (updates, next_store_state)
 
@@ -819,7 +823,7 @@ class NeuralMemory(Module):
 
         next_state = (next_last_update, next_last_momentum)
 
-        next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, next_state, updates)
+        next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, remainder_mask, next_state, updates)
 
         # return updates to neural memory at all chunked timesteps + neural mem cache / state to be fed back
 
@@ -949,9 +953,9 @@ class NeuralMemory(Module):
         # handle previous state init
 
         if not exists(state):
-            state = (0, None, None, None, None)
+            state = NeuralMemState(0, None, None, None, None, None)
 
-        seq_index, weights, cache_store_seq, past_state, updates = state
+        seq_index, weights, cache_store_seq, cache_store_mask, past_state, updates = state
 
         # store
 
@@ -960,6 +964,13 @@ class NeuralMemory(Module):
         # take care of cache
 
         if exists(cache_store_seq):
+            if exists(cache_store_mask) or exists(store_mask):
+                if not exists(cache_store_mask):
+                    cache_store_mask = torch.ones(cache_store_seq.shape[-3:-1], dtype = torch.bool, device = cache_store_seq.device)
+                if not exists(store_mask):
+                    store_mask = torch.ones(store_seq.shape[-3:-1], dtype = torch.bool, device = store_seq.device)
+                store_mask = cat((cache_store_mask, store_mask), dim = -1)
+
             store_seq = safe_cat((cache_store_seq, store_seq))
 
         # compute split sizes of sequence
