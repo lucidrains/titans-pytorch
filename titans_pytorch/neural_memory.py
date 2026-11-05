@@ -154,6 +154,7 @@ def softclamp_grad_norm(t, max_value):
 
     norm = t.norm(dim = -1, keepdim = True)
     clamped_norm = softclamp_max(norm, max_value)
+    norm = norm.masked_fill(norm == 0, 1.)
 
     t = t * (clamped_norm / norm)
     return inverse(t)

@@ -77,6 +77,25 @@ def test_titans(
 
     assert seq.shape == retrieved.shape
 
+def test_masked_neural_memory_grad_clipping():
+    with torch.random.fork_rng():
+        torch.manual_seed(5)
+        mem = NeuralMemory(dim = 8, chunk_size = 2, max_grad_norm = 2.).double()
+        seq = torch.randn(1, 4, 8, dtype = torch.float64)
+
+    store_mask = torch.tensor([[False, False, True, True]])
+    retrieved, state = mem(seq, store_mask = store_mask)
+
+    assert torch.isfinite(retrieved).all()
+    for part in state.states:
+        for value in part.values():
+            assert torch.isfinite(value).all()
+
+    grads = torch.autograd.grad(retrieved.square().mean(), tuple(mem.parameters()), allow_unused = True)
+    for grad in grads:
+        if exists(grad):
+            assert torch.isfinite(grad).all()
+
 @pytest.mark.parametrize('segments', ((4, 4), (1, 3), (1, 7), (3, 2, 3), (1, 2, 4), (5, 2, 1), (5, 1, 2)))
 @pytest.mark.parametrize('chunk_size', (2, 4))
 @pytest.mark.parametrize('batch_size', (None, 4))

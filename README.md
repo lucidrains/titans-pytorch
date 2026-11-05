@@ -37,6 +37,8 @@ retrieved, mem_state = mem(seq)
 assert seq.shape == retrieved.shape
 ```
 
+Set `max_grad_norm` on `NeuralMemory` to soft-clamp storage gradients. A boolean `store_mask` of shape `(batch, sequence)` can exclude tokens from storage, including entire chunks; zero storage gradients remain zero with gradient clipping enabled.
+
 A transformer with the `MAC` configuration can be used as
 
 ```python
