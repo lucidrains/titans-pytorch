@@ -493,3 +493,24 @@ def test_mem_state_detach():
         parallel_retrieved, state = mem(seq, state = state, store_mask = store_mask)
         state = mem_state_detach(state)
         parallel_retrieved.sum().backward()
+
+
+@pytest.mark.parametrize('dtype', (torch.float32, torch.float64))
+@pytest.mark.parametrize('device', ('cpu', 'cuda'))
+def test_custom_memory_model_dtype_device(dtype, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip()
+
+    from titans_pytorch.memory_models import MemoryMLP
+
+    model = MemoryMLP(dim = 8, depth = 2).to(device = device, dtype = dtype)
+    mem = NeuralMemory(dim = 8, model = model).to(device = device, dtype = dtype)
+    seq = torch.randn(2, 4, 8, device = device, dtype = dtype)
+
+    retrieved, _ = mem(seq)
+    assert retrieved.shape == seq.shape
+    assert retrieved.dtype == dtype
+    assert retrieved.device == seq.device
+    assert torch.isfinite(retrieved).all()
+    retrieved.square().mean().backward()
+    assert any(parameter.grad is not None for parameter in mem.parameters())
