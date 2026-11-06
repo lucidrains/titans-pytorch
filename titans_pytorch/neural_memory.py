@@ -363,7 +363,8 @@ class NeuralMemory(Module):
 
         with torch.no_grad():
             try:
-                test_input = torch.randn(test_shape)
+                parameter = next(model.parameters(), None)
+                test_input = torch.randn(test_shape, device = parameter.device, dtype = parameter.dtype) if exists(parameter) else torch.randn(test_shape)
                 mem_model_output = model(test_input)
             except:
                 raise RuntimeError(f'memory model unable to accept a tensor of shape {test_shape}')
